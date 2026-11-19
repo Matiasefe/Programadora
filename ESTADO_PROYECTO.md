@@ -14,6 +14,7 @@ Programa flash interna F1…H7/U5 y Riverdi con `.stldr` (QSPI/OSPI) **sin** Cub
 - Flasher F4: `connect_rst`, erase en sesión aparte, verify post-load.
 - Fix run-after: SP/PC **antes** de `monitor reset` (BMP desconecta al pulsar NRST).
 - Fix falso AVISO erase (no confundir con “timeout to wait for device halts”).
+- STLDR v10: timeout MassErase escalado (~60 MB ya no corta a 20 min); SectorErase por lotes.
 
 ## Flasheo F4 (checklist si falla)
 

@@ -17,13 +17,39 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 9
+STLDR_RUNNER_VERSION = 10
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
 CHUNK_SIZE = 4096
 RAM_MIN = 0x20000000
 WRITE_BATCH = 64  # bloques por sesión GDB (menos = más feedback / reconnect)
+# SectorErase por sesión GDB (imágenes grandes: no meter 15k continues en un script)
+SECTOR_ERASE_BATCH = 128
+
+
+def _fmt_bytes(n: int) -> str:
+    if n >= 1024 * 1024:
+        return f"{n / (1024 * 1024):.1f} MB"
+    if n >= 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n} B"
+
+
+def _mass_erase_timeout_s(ext_bytes: int) -> int:
+    """Timeout MassErase vía .stldr/SWD.
+
+    En Riverdi ~60 MB el chip erase puede superar 20 min; el límite fijo
+    de 1200s mataba GDB mientras todavía borraba.
+    """
+    mb = max(1.0, ext_bytes / (1024 * 1024))
+    # piso 45 min; ~2 min/MB de margen; techo 3 h
+    return int(min(3 * 3600, max(45 * 60, mb * 120)))
+
+
+def _sector_erase_timeout_s(nsec: int) -> int:
+    # ~2–8 s/sector vía trampolín; piso 10 min; techo 3 h por sesión
+    return int(min(3 * 3600, max(600, nsec * 8)))
 
 
 def _posix(path: Path) -> str:
@@ -136,13 +162,15 @@ def _session_preamble(
     port: str,
     restore_ram: list[str],
     log_name: str,
+    remotetimeout: int = 600,
 ) -> list[str]:
     # GDB reciente: "set logging redirect on" + "enabled on"
     # (NO "redirected" — falla en gnu-tools 14.x / CubeIDE 2.x)
+    rt = max(600, int(remotetimeout))
     return [
         "set confirm off",
         "set pagination off",
-        "set remotetimeout 600",
+        f"set remotetimeout {rt}",
         f"set logging file {_posix(tmp / log_name)}",
         "set logging overwrite on",
         "set logging redirect on",
@@ -213,7 +241,15 @@ def program_external(
 
     min_a, max_a = min(addrs), max(addrs)
     total = max_a - min_a + 1
-    log(f"Externa HEX: 0x{min_a:08X} .. 0x{max_a:08X} (span {total})")
+    log(
+        f"Externa HEX: 0x{min_a:08X} .. 0x{max_a:08X} "
+        f"(span {total} = {_fmt_bytes(total)})"
+    )
+    if total >= 16 * 1024 * 1024:
+        log(
+            "AVISO: imagen externa grande — Erase/Write pueden tardar "
+            "decenas de minutos. No canceles mientras diga «GDB sigue»."
+        )
 
     log("Generando imagen binaria…")
     blob = bytes(ih.tobinarray(start=min_a, size=total))
@@ -246,7 +282,7 @@ def program_external(
         return False
 
     # --- Fase 1: solo Init (fail-fast si el trampolín no vuelve) ---
-    log("=== Fase 1/3: Init (timeout 120s) ===")
+    log("=== Fase 1/4: Init (timeout 120s) ===")
     lines = _session_preamble(tmp, port, restore_ram, "gdb_init.log")
     _append_call(
         lines,
@@ -272,18 +308,22 @@ def program_external(
     # Un solo SectorErase(min,max) a veces no borra todo el rango en estos
     # loaders → Write “OK” pero datos corruptos → pantalla negra.
     log("=== Fase 2/4: Erase ===")
-    lines = _session_preamble(tmp, port, restore_ram, "gdb_erase.log")
-    _append_call(
-        lines,
-        func=int(init_addr),
-        trampoline=trampoline,
-        stack=stack_addr,
-        label="Init",
-    )
     if mass_addr is not None:
+        erase_timeout = _mass_erase_timeout_s(len(blob))
         log(
-            "MassErase() del chip OSPI/QSPI — puede tardar varios minutos; "
-            "es lo más fiable para Riverdi"
+            f"MassErase() del chip OSPI/QSPI — timeout {erase_timeout}s "
+            f"(~{erase_timeout // 60} min) para {_fmt_bytes(len(blob))}. "
+            "No canceles; el heartbeat «GDB sigue» es normal."
+        )
+        lines = _session_preamble(
+            tmp, port, restore_ram, "gdb_erase.log", remotetimeout=erase_timeout
+        )
+        _append_call(
+            lines,
+            func=int(init_addr),
+            trampoline=trampoline,
+            stack=stack_addr,
+            label="Init",
         )
         _append_call(
             lines,
@@ -292,47 +332,79 @@ def program_external(
             stack=stack_addr,
             label="MassErase",
         )
-        erase_timeout = 1200
+        lines.extend(["detach", "quit"])
+        script = tmp / "phase_erase.gdb"
+        _write_gdb_script(script, lines)
+        if not _run_gdb_live(
+            gdb,
+            script,
+            cwd=tmp,
+            log_name="gdb_erase.log",
+            log=log,
+            timeout_s=erase_timeout,
+        ):
+            log("ERROR en fase Erase (MassErase)")
+            return False
     elif sector_addr is not None:
-        nsec = 0
+        # Imágenes grandes: varios scripts GDB (evita un continue×15k)
+        sectors: list[tuple[int, int]] = []
         a = min_a & ~(SECTOR_ERASE_STEP - 1)
-        log(
-            f"SectorErase sector a sector 0x{SECTOR_ERASE_STEP:X} "
-            f"desde 0x{a:X} hasta 0x{max_a:X}"
-        )
         while a <= max_a:
             end_a = min(a + SECTOR_ERASE_STEP - 1, max_a)
+            sectors.append((a, end_a))
+            a += SECTOR_ERASE_STEP
+        log(
+            f"SectorErase ×{len(sectors)} (paso 0x{SECTOR_ERASE_STEP:X}) "
+            f"0x{sectors[0][0]:X}..0x{max_a:X} en lotes de {SECTOR_ERASE_BATCH}"
+        )
+        n_sec_batches = (len(sectors) + SECTOR_ERASE_BATCH - 1) // SECTOR_ERASE_BATCH
+        for sb in range(0, len(sectors), SECTOR_ERASE_BATCH):
+            batch = sectors[sb : sb + SECTOR_ERASE_BATCH]
+            batch_i = sb // SECTOR_ERASE_BATCH + 1
+            erase_timeout = _sector_erase_timeout_s(len(batch))
+            log_name = f"gdb_erase_{batch_i:03d}.log"
+            log(
+                f"--- Erase lote {batch_i}/{n_sec_batches}: "
+                f"{len(batch)} sectores (timeout {erase_timeout}s) ---"
+            )
+            lines = _session_preamble(
+                tmp, port, restore_ram, log_name, remotetimeout=erase_timeout
+            )
             _append_call(
                 lines,
-                func=int(sector_addr),
+                func=int(init_addr),
                 trampoline=trampoline,
                 stack=stack_addr,
-                label=f"Sec{nsec}",
-                r0=a,
-                r1=end_a,
+                label="Init",
             )
-            if nsec % 16 == 0:
-                lines.append(f"echo ERASE_SEC {nsec}")
-            a += SECTOR_ERASE_STEP
-            nsec += 1
-        erase_timeout = max(600, nsec * 8)
-        log(f"Total SectorErase: {nsec}")
+            for j, (sa, ea) in enumerate(batch):
+                global_i = sb + j
+                _append_call(
+                    lines,
+                    func=int(sector_addr),
+                    trampoline=trampoline,
+                    stack=stack_addr,
+                    label=f"Sec{global_i}",
+                    r0=sa,
+                    r1=ea,
+                )
+                if global_i % 16 == 0:
+                    lines.append(f"echo ERASE_SEC {global_i}/{len(sectors)}")
+            lines.extend(["detach", "quit"])
+            script = tmp / f"phase_erase_{batch_i:03d}.gdb"
+            _write_gdb_script(script, lines)
+            if not _run_gdb_live(
+                gdb,
+                script,
+                cwd=tmp,
+                log_name=log_name,
+                log=log,
+                timeout_s=erase_timeout,
+            ):
+                log(f"ERROR en fase Erase lote {batch_i}/{n_sec_batches}")
+                return False
     else:
         log("AVISO: sin erase en el loader — se intenta Write directo")
-        erase_timeout = 120
-    lines.extend(["detach", "quit"])
-    script = tmp / "phase_erase.gdb"
-    _write_gdb_script(script, lines)
-    if not _run_gdb_live(
-        gdb,
-        script,
-        cwd=tmp,
-        log_name="gdb_erase.log",
-        log=log,
-        timeout_s=erase_timeout,
-    ):
-        log("ERROR en fase Erase")
-        return False
     log("Erase OK — seguimos")
 
     # --- Fase 3: Writes por lotes ---
@@ -346,7 +418,10 @@ def program_external(
             f"bloques {batch_start}..{batch_start + len(batch) - 1} ---"
         )
         log_name = f"gdb_write_{batch_i:03d}.log"
-        lines = _session_preamble(tmp, port, restore_ram, log_name)
+        write_timeout = max(300, len(batch) * 20)
+        lines = _session_preamble(
+            tmp, port, restore_ram, log_name, remotetimeout=write_timeout
+        )
         _append_call(
             lines,
             func=int(init_addr),
@@ -378,7 +453,7 @@ def program_external(
             cwd=tmp,
             log_name=log_name,
             log=log,
-            timeout_s=max(300, len(batch) * 15),
+            timeout_s=write_timeout,
         )
         if not ok:
             log(f"ERROR en lote Write {batch_i}/{n_batches}")
@@ -439,7 +514,10 @@ def _run_gdb_live(
             pass
 
     args = [gdb, "-nx", "--batch", "--quiet", "-x", _posix(script)]
-    log(f"Ejecutando: {script.name} (timeout {timeout_s}s) — mirá mensajes >>> / RET_")
+    log(
+        f"Ejecutando: {script.name} (timeout {timeout_s}s / ~{timeout_s // 60} min) "
+        "— mirá mensajes >>> / RET_"
+    )
     start = time.monotonic()
     try:
         proc = subprocess.Popen(
@@ -456,6 +534,8 @@ def _run_gdb_live(
 
     pos = 0
     last_hb = start
+    # Heartbeat más espaciado en operaciones largas (MassErase 60 MB, etc.)
+    hb_every = 30.0 if timeout_s >= 900 else 10.0
     combined: list[str] = []
 
     while True:
@@ -473,8 +553,13 @@ def _run_gdb_live(
                         log(ln)
                         combined.append(ln)
         now = time.monotonic()
-        if now - last_hb >= 10 and rc is None:
-            log(f"... GDB sigue ({int(now - start)}s) — si está en Erase/Init es normal")
+        if now - last_hb >= hb_every and rc is None:
+            elapsed = int(now - start)
+            left = max(0, timeout_s - elapsed)
+            log(
+                f"... GDB sigue ({elapsed}s, quedan ~{left}s) — "
+                "Erase/Write largo es normal; no canceles"
+            )
             last_hb = now
         if rc is not None:
             # drenar stdout por si logging falló
@@ -489,7 +574,10 @@ def _run_gdb_live(
                         combined.append(ln)
             break
         if now - start > timeout_s:
-            log(f"ERROR: timeout {timeout_s}s — matando GDB")
+            log(
+                f"ERROR: timeout {timeout_s}s — matando GDB. "
+                "Si era MassErase de imagen grande, reintentá (v10 sube el límite)."
+            )
             proc.kill()
             try:
                 proc.wait(timeout=5)
