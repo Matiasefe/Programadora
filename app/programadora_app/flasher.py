@@ -130,31 +130,36 @@ def flash(
 
 
 def _connect_under_reset_cmds() -> list[str]:
-    """BMP antiguo: connect_srst; BMD reciente: connect_rst. Mandamos ambos."""
-    return [
-        "monitor connect_rst enable",
-        "monitor connect_srst enable",
-    ]
+    """Solo connect_rst (BMD). connect_srst ya no existe y ensucia el log."""
+    return ["monitor connect_rst enable"]
 
 
 def _run_after_programming(gdb: str, port: str, log: LogFn) -> None:
-    """Reset + arrancar desde vectores en 0x08000000 (Run after programming)."""
+    """Arrancar el MCU tras programar.
+
+    En BMP, ``monitor reset`` pulsa NRST y **desconecta** el target: no se puede
+    escribir SP/PC después. Secuencia correcta:
+    1) attach + cargar SP/PC desde vectores + quitar C_HALT
+    2) detach
+    3) desactivar connect-under-reset y pulsar NRST para boot limpio
+    """
     log("=== Run after programming ===")
     cmds = [
         "set confirm off",
         "set pagination off",
         "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
-        *_connect_under_reset_cmds(),
+        "monitor connect_rst disable",
         "monitor swdp_scan",
         "attach 1",
         "monitor halt",
-        "monitor reset halt",
         "set $sp = *(unsigned int*)0x08000000",
         "set $pc = *(unsigned int*)0x08000004",
-        # DHCSR: DBGKEY | C_DEBUGEN  → salir de halt y dejar correr
+        # DHCSR: DBGKEY | C_DEBUGEN  (C_HALT=0 → correr)
         "set *(unsigned int*)0xE000EDF0 = 0xA05F0001",
         "detach",
+        # Pulso NRST sin attach: el firmware arranca solo desde flash
+        "monitor reset",
         "quit",
     ]
     args = [gdb, "-nx", "--batch", "--quiet"]
@@ -173,10 +178,14 @@ def _run_after_programming(gdb: str, port: str, log: LogFn) -> None:
     for line in out.splitlines():
         if line.strip():
             log(line)
-    if proc.returncode != 0:
-        log(f"AVISO: run after programming GDB código {proc.returncode}")
+    mem_fail = "cannot access memory" in out.lower()
+    if proc.returncode != 0 or mem_fail:
+        log(
+            "AVISO: no se pudo preparar SP/PC; se intentó reset por NRST. "
+            "Si el MCU no arranca, desconectá USB SWD un momento o power-cycle."
+        )
     else:
-        log("Target en run (reset + PC/SP desde 0x08000000 + detach).")
+        log("MCU liberado: SP/PC desde vectores + pulso NRST (debe correr solo).")
 
 
 def _flash_internal(
@@ -209,7 +218,9 @@ def _flash_internal(
         erase_ok, erase_blob = _run_gdb(
             gdb, erase_cmds, log, timeout_s=180, label="erase"
         )
-        if not erase_ok or _erase_looks_broken(erase_blob):
+        if _erase_succeeded(erase_blob):
+            log("erase_mass OK.")
+        elif not erase_ok or _erase_looks_broken(erase_blob):
             log(
                 "AVISO: erase_mass falló o dejó el canal GDB inestable "
                 "(conocido en F4). Se reintenta attach + load (borra por sector)."
@@ -315,13 +326,26 @@ def _run_gdb(
     return True, blob
 
 
+def _erase_succeeded(blob: str) -> bool:
+    """True si BMP reportó borrado completo (ignora ruido de 'timeout' del halt)."""
+    low = (blob or "").lower()
+    if "erasing device flash" in low and "done" in low:
+        return True
+    if "erase complete" in low:
+        return True
+    return False
+
+
 def _erase_looks_broken(blob: str) -> bool:
     low = blob.lower()
     if not blob:
         return True
+    if _erase_succeeded(blob):
+        return False
     if "packet error" in low:
         return True
-    if "timed out" in low or "timeout" in low:
+    # No matchear "timeout to wait for device halts: 2000" (mensaje informativo BMP)
+    if "timed out" in low or "request timed out" in low:
         return True
     if "failed" in low and "erase" in low:
         return True

@@ -235,9 +235,7 @@ def flash_hex(
         "set pagination off",
         "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
-        # BMD reciente: connect_rst; BMP antiguo: connect_srst
         "monitor connect_rst enable",
-        "monitor connect_srst enable",
         "monitor swdp_scan",
         "attach 1",
         "monitor halt",
@@ -252,11 +250,15 @@ def flash_hex(
     if verify and hex_path.suffix.lower() in {".elf"}:
         cmds.append("compare-sections")
     if reset:
-        cmds.append("monitor reset")
+        # SP/PC ANTES de monitor reset (BMP desconecta al pulsar NRST)
         cmds.append("set $sp = *(unsigned int*)0x08000000")
         cmds.append("set $pc = *(unsigned int*)0x08000004")
         cmds.append("set *(unsigned int*)0xE000EDF0 = 0xA05F0001")
-    cmds.append("detach")
+        cmds.append("detach")
+        cmds.append("monitor connect_rst disable")
+        cmds.append("monitor reset")
+    else:
+        cmds.append("detach")
     cmds.append("quit")
 
     proc = run_gdb(gdb, cmds)
@@ -284,7 +286,6 @@ def dump_flash(gdb: str, port: str) -> int:
         "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
         "monitor connect_rst enable",
-        "monitor connect_srst enable",
         "monitor swdp_scan",
         "attach 1",
         "x/8xw 0x08000000",

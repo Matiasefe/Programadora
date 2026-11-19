@@ -11,7 +11,9 @@ Programa flash interna F1…H7/U5 y Riverdi con `.stldr` (QSPI/OSPI) **sin** Cub
 - Flash interna U5 verificada.
 - Firmware Blue Pill y PCB propia (PB13/PB14/PB5) en `firmware/`.
 - Repo reorganizado en la **raíz** (sin carpeta `Programadora-main/`).
-- Flasher F4 endurecido: `connect_rst` + `connect_srst`, `erase_mass` en sesión aparte, verify post-load, hints.
+- Flasher F4: `connect_rst`, erase en sesión aparte, verify post-load.
+- Fix run-after: SP/PC **antes** de `monitor reset` (BMP desconecta al pulsar NRST).
+- Fix falso AVISO erase (no confundir con “timeout to wait for device halts”).
 
 ## Flasheo F4 (checklist si falla)
 
