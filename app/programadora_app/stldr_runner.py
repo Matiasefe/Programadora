@@ -17,18 +17,22 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 12
+STLDR_RUNNER_VERSION = 13
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
 CHUNK_SIZE = 4096
 RAM_MIN = 0x20000000
-WRITE_BATCH = 64  # bloques por sesión GDB (menos = más feedback / reconnect)
+# Lotes chicos: con 64, Riverdi ~18 MB cortaba USB a mitad de sesión
+# ("Remote connection closed"). 16 = más reconnects, más estable.
+WRITE_BATCH = 16
+WRITE_BATCH_RETRIES = 4
+WRITE_BATCH_PAUSE_S = 0.75
 # SectorErase por sesión GDB (imágenes grandes: no meter 15k continues en un script)
 SECTOR_ERASE_BATCH = 128
 # Tope SWD medido en la sonda F103 (BMP clampa 8→6 MHz)
 MAX_SWD_FREQ_HZ = 6_000_000
-DEFAULT_SWD_FREQ_HZ = 3_272_727
+DEFAULT_SWD_FREQ_HZ = 2_000_000
 
 
 def _fmt_bytes(n: int) -> str:
@@ -431,65 +435,83 @@ def program_external(
     log("Erase OK — seguimos")
 
     # --- Fase 3: Writes por lotes ---
-    log(f"=== Fase 3/4: Write ({len(chunk_files)} bloques, lotes de {WRITE_BATCH}) ===")
+    n_batches = (len(chunk_files) + WRITE_BATCH - 1) // WRITE_BATCH
+    log(
+        f"=== Fase 3/4: Write ({len(chunk_files)} bloques, "
+        f"lotes de {WRITE_BATCH}, ~{n_batches} sesiones GDB) ==="
+    )
     for batch_start in range(0, len(chunk_files), WRITE_BATCH):
         batch = chunk_files[batch_start : batch_start + WRITE_BATCH]
         batch_i = batch_start // WRITE_BATCH + 1
-        n_batches = (len(chunk_files) + WRITE_BATCH - 1) // WRITE_BATCH
         log(
             f"--- Lote {batch_i}/{n_batches}: "
             f"bloques {batch_start}..{batch_start + len(batch) - 1} ---"
         )
-        log_name = f"gdb_write_{batch_i:03d}.log"
-        write_timeout = max(300, len(batch) * 20)
-        lines = _session_preamble(
-            tmp,
-            port,
-            restore_ram,
-            log_name,
-            remotetimeout=write_timeout,
-            swd_freq_hz=swd_freq_hz,
-        )
-        _append_call(
-            lines,
-            func=int(init_addr),
-            trampoline=trampoline,
-            stack=stack_addr,
-            label="Init",
-        )
-        for j, (waddr, rel, size) in enumerate(batch):
-            global_i = batch_start + j
-            lines.append(f"restore {rel} binary 0x{scratch:X}")
+        write_timeout = max(180, len(batch) * 25)
+        ok = False
+        for attempt in range(1, WRITE_BATCH_RETRIES + 1):
+            log_name = f"gdb_write_{batch_i:03d}_a{attempt}.log"
+            if attempt > 1:
+                pause = 1.5 * attempt
+                log(
+                    f"Reintento {attempt}/{WRITE_BATCH_RETRIES} del lote "
+                    f"{batch_i} (pausa {pause:.1f}s; típico tras "
+                    "Remote connection closed)…"
+                )
+                time.sleep(pause)
+            lines = _session_preamble(
+                tmp,
+                port,
+                restore_ram,
+                log_name,
+                remotetimeout=write_timeout,
+                swd_freq_hz=swd_freq_hz,
+            )
             _append_call(
                 lines,
-                func=int(write_addr),
+                func=int(init_addr),
                 trampoline=trampoline,
                 stack=stack_addr,
-                label=f"W{global_i}",
-                r0=waddr,
-                r1=size,
-                r2=scratch,
+                label="Init",
             )
-            if global_i % 8 == 0:
-                lines.append(f"echo PROG {global_i}/{len(chunk_files)}")
-        lines.extend(["detach", "quit"])
-        script = tmp / f"phase_write_{batch_i:03d}.gdb"
-        _write_gdb_script(script, lines)
-        ok = _run_gdb_live(
-            gdb,
-            script,
-            cwd=tmp,
-            log_name=log_name,
-            log=log,
-            timeout_s=write_timeout,
-        )
+            for j, (waddr, rel, size) in enumerate(batch):
+                global_i = batch_start + j
+                lines.append(f"restore {rel} binary 0x{scratch:X}")
+                _append_call(
+                    lines,
+                    func=int(write_addr),
+                    trampoline=trampoline,
+                    stack=stack_addr,
+                    label=f"W{global_i}",
+                    r0=waddr,
+                    r1=size,
+                    r2=scratch,
+                )
+                if global_i % 8 == 0:
+                    lines.append(f"echo PROG {global_i}/{len(chunk_files)}")
+            lines.extend(["detach", "quit"])
+            script = tmp / f"phase_write_{batch_i:03d}_a{attempt}.gdb"
+            _write_gdb_script(script, lines)
+            ok = _run_gdb_live(
+                gdb,
+                script,
+                cwd=tmp,
+                log_name=log_name,
+                log=log,
+                timeout_s=write_timeout,
+            )
+            if ok:
+                break
         if not ok:
-            log(f"ERROR en lote Write {batch_i}/{n_batches}")
+            log(f"ERROR en lote Write {batch_i}/{n_batches} tras reintentos")
             log(
-                "Si ves «Remote connection closed» / lockup: bajá la "
-                "velocidad SWD en la GUI (p. ej. 2 MHz o 3.3 MHz) y reintentá."
+                "«Remote connection closed» suele ser USB/SWD inestable en "
+                "sesiones largas. Probá SWD 1–2 MHz en la GUI, cable corto, "
+                "otro puerto USB; la flash interna puede haber quedado OK."
             )
             return False
+        if batch_i < n_batches:
+            time.sleep(WRITE_BATCH_PAUSE_S)
 
     # --- Fase 4: verificar primeras palabras + reset para arrancar la app ---
     log("=== Fase 4/4: Verificar 0x90000000 + reset ===")

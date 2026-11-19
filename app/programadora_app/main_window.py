@@ -28,13 +28,13 @@ from .gdb_find import find_gdb
 from .probe import list_ports, pick_gdb_port
 
 
-# (Hz, etiqueta GUI). Default = default BMP (~3.3 MHz), estable en Write largo.
+# (Hz, etiqueta GUI). Default 2 MHz: Riverdi grande cortaba a 3.3/6 MHz.
 SWD_FREQ_CHOICES: list[tuple[int, str]] = [
-    (1_000_000, "1 MHz — más estable / más lento"),
-    (2_000_000, "2 MHz"),
-    (3_272_727, "3.3 MHz — default BMP (recomendado)"),
+    (1_000_000, "1 MHz — máxima estabilidad"),
+    (2_000_000, "2 MHz — recomendado Riverdi grande"),
+    (3_272_727, "3.3 MHz — default BMP"),
     (4_000_000, "4 MHz"),
-    (6_000_000, "6 MHz — máx. F103 (puede cortar en Riverdi grande)"),
+    (6_000_000, "6 MHz — máx. F103 (poco estable en Write largo)"),
 ]
 
 
@@ -147,10 +147,10 @@ class MainWindow(QMainWindow):
         self.swd_freq = QComboBox()
         for hz, label in SWD_FREQ_CHOICES:
             self.swd_freq.addItem(label, hz)
-        # Default: 3.3 MHz (estable; 6 MHz cortó Write en Riverdi ~18 MB)
+        # Default: 2 MHz (3.3 MHz aún cortó en lote Write ~22/74)
         idx_default = next(
-            (i for i, (hz, _) in enumerate(SWD_FREQ_CHOICES) if hz == 3_272_727),
-            2,
+            (i for i, (hz, _) in enumerate(SWD_FREQ_CHOICES) if hz == 2_000_000),
+            1,
         )
         self.swd_freq.setCurrentIndex(idx_default)
         fg.addWidget(QLabel("Velocidad SWD:"), 3, 0)
@@ -169,7 +169,8 @@ class MainWindow(QMainWindow):
             "Sin .stldr: solo flash interna (F1…H7/U5).\n"
             "Con .stldr: si el HEX tiene región 0x90000000, se programa la QSPI/OSPI "
             "ejecutando el loader en el destino (sin CubeProgrammer).\n"
-            "Si falla con «Remote connection closed» en Write: bajá SWD a 2 o 3.3 MHz."
+            "Si falla con «Remote connection closed» en Write: SWD 1–2 MHz, "
+            "cable corto / otro USB. La app reintenta lotes solos (STLDR v13)."
         )
         hint.setWordWrap(True)
         fg.addWidget(hint, 6, 0, 1, 3)
@@ -303,7 +304,7 @@ class MainWindow(QMainWindow):
 
         self.btn_flash.setEnabled(False)
         self.progress.setVisible(True)
-        swd_hz = int(self.swd_freq.currentData() or 3_272_727)
+        swd_hz = int(self.swd_freq.currentData() or 2_000_000)
         self.append_log("")
         self.append_log(
             f"=== Programar | familia={self.family.currentText()} | "

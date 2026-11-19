@@ -17,7 +17,7 @@ LogFn = Callable[[str], None]
 
 # Default BMP / estable en Write largo Riverdi. 6 MHz es el tope F103 pero puede
 # cortar la sesión USB ("Remote connection closed").
-DEFAULT_SWD_FREQ_HZ = 3_272_727
+DEFAULT_SWD_FREQ_HZ = 2_000_000
 MAX_SWD_FREQ_HZ = 6_000_000
 
 
