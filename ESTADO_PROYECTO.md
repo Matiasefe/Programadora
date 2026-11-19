@@ -15,7 +15,8 @@ Programa flash interna F1…H7/U5 y Riverdi con `.stldr` (QSPI/OSPI) **sin** Cub
 - Fix run-after: SP/PC **antes** de `monitor reset` (BMP desconecta al pulsar NRST).
 - Fix falso AVISO erase (no confundir con “timeout to wait for device halts”).
 - STLDR v10: timeout MassErase escalado (~60 MB ya no corta a 20 min); SectorErase por lotes.
-- SWD fijo a **6 MHz** en cada sesión GDB (flasher + STLDR v11); tope de la sonda F103.
+- GUI: selector **Velocidad SWD** (1 / 2 / 3.3 / 4 / 6 MHz). Default 3.3 MHz.
+- 6 MHz puede cortar Write Riverdi (`Remote connection closed`); bajar a 2–3.3 MHz.
 
 ## Flasheo F4 (checklist si falla)
 

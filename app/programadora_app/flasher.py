@@ -15,12 +15,15 @@ from . import stldr_runner
 
 LogFn = Callable[[str], None]
 
-# Tope medido en la sonda F103 (pedí 8 MHz y BMP clampa a 6 MHz).
-BMP_SWD_FREQ_HZ = 6_000_000
+# Default BMP / estable en Write largo Riverdi. 6 MHz es el tope F103 pero puede
+# cortar la sesión USB ("Remote connection closed").
+DEFAULT_SWD_FREQ_HZ = 3_272_727
+MAX_SWD_FREQ_HZ = 6_000_000
 
 
-def _swd_freq_cmds() -> list[str]:
-    return [f"monitor frequency {BMP_SWD_FREQ_HZ}"]
+def _swd_freq_cmds(hz: int) -> list[str]:
+    hz = max(100_000, min(int(hz), MAX_SWD_FREQ_HZ))
+    return [f"monitor frequency {hz}"]
 
 
 def flash(
@@ -30,6 +33,7 @@ def flash(
     gdb_path: str | None = None,
     erase: bool = True,
     run_after: bool = True,
+    swd_freq_hz: int = DEFAULT_SWD_FREQ_HZ,
     log: LogFn | None = None,
 ) -> bool:
     log = log or print
@@ -45,8 +49,9 @@ def flash(
     log(f"GDB: {gdb}")
 
     port = normalize_port(port)
+    swd_freq_hz = max(100_000, min(int(swd_freq_hz), MAX_SWD_FREQ_HZ))
     log(f"Puerto: {port}")
-    log(f"SWD: {BMP_SWD_FREQ_HZ} Hz (monitor frequency en cada sesión GDB)")
+    log(f"SWD: {swd_freq_hz} Hz (monitor frequency en cada sesión GDB)")
 
     suffix = hex_path.suffix.lower()
     if suffix == ".elf":
@@ -57,9 +62,11 @@ def flash(
             )
             return False
         log("=== Flash interna desde ELF (BMP / GDB load) ===")
-        ok = _flash_internal(gdb, port, hex_path, erase=erase, log=log)
+        ok = _flash_internal(
+            gdb, port, hex_path, erase=erase, swd_freq_hz=swd_freq_hz, log=log
+        )
         if ok and run_after:
-            _run_after_programming(gdb, port, log)
+            _run_after_programming(gdb, port, swd_freq_hz, log)
         if ok:
             log("=== Listo ===")
         return ok
@@ -105,7 +112,14 @@ def flash(
 
     if split.internal_path and split.internal_bytes:
         log("=== Flash interna (BMP / GDB load) ===")
-        ok = _flash_internal(gdb, port, split.internal_path, erase=erase, log=log)
+        ok = _flash_internal(
+            gdb,
+            port,
+            split.internal_path,
+            erase=erase,
+            swd_freq_hz=swd_freq_hz,
+            log=log,
+        )
         if not ok:
             return False
     else:
@@ -121,6 +135,7 @@ def flash(
             stldr=Path(stldr_path).resolve(),
             external_hex=split.external_path,
             log=log,
+            swd_freq_hz=swd_freq_hz,
         )
         if not ok:
             return False
@@ -131,7 +146,7 @@ def flash(
         )
 
     if run_after:
-        _run_after_programming(gdb, port, log)
+        _run_after_programming(gdb, port, swd_freq_hz, log)
 
     log("=== Listo ===")
     return True
@@ -142,7 +157,9 @@ def _connect_under_reset_cmds() -> list[str]:
     return ["monitor connect_rst enable"]
 
 
-def _run_after_programming(gdb: str, port: str, log: LogFn) -> None:
+def _run_after_programming(
+    gdb: str, port: str, swd_freq_hz: int, log: LogFn
+) -> None:
     """Arrancar el MCU tras programar.
 
     En BMP, ``monitor reset`` pulsa NRST y **desconecta** el target: no se puede
@@ -157,7 +174,7 @@ def _run_after_programming(gdb: str, port: str, log: LogFn) -> None:
         "set pagination off",
         "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
-        *_swd_freq_cmds(),
+        *_swd_freq_cmds(swd_freq_hz),
         "monitor connect_rst disable",
         "monitor swdp_scan",
         "attach 1",
@@ -202,6 +219,7 @@ def _flash_internal(
     port: str,
     hex_path: Path,
     erase: bool,
+    swd_freq_hz: int,
     log: LogFn,
 ) -> bool:
     image = hex_path.as_posix()
@@ -216,7 +234,7 @@ def _flash_internal(
             "set pagination off",
             "set mem inaccessible-by-default off",
             f"target extended-remote {port}",
-            *_swd_freq_cmds(),
+            *_swd_freq_cmds(swd_freq_hz),
             *_connect_under_reset_cmds(),
             "monitor swdp_scan",
             "attach 1",
@@ -244,7 +262,7 @@ def _flash_internal(
         "set pagination off",
         "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
-        *_swd_freq_cmds(),
+        *_swd_freq_cmds(swd_freq_hz),
         *_connect_under_reset_cmds(),
         "monitor swdp_scan",
         "attach 1",

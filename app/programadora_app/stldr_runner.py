@@ -17,7 +17,7 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 11
+STLDR_RUNNER_VERSION = 12
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
@@ -27,7 +27,8 @@ WRITE_BATCH = 64  # bloques por sesión GDB (menos = más feedback / reconnect)
 # SectorErase por sesión GDB (imágenes grandes: no meter 15k continues en un script)
 SECTOR_ERASE_BATCH = 128
 # Tope SWD medido en la sonda F103 (BMP clampa 8→6 MHz)
-BMP_SWD_FREQ_HZ = 6_000_000
+MAX_SWD_FREQ_HZ = 6_000_000
+DEFAULT_SWD_FREQ_HZ = 3_272_727
 
 
 def _fmt_bytes(n: int) -> str:
@@ -165,10 +166,12 @@ def _session_preamble(
     restore_ram: list[str],
     log_name: str,
     remotetimeout: int = 600,
+    swd_freq_hz: int = DEFAULT_SWD_FREQ_HZ,
 ) -> list[str]:
     # GDB reciente: "set logging redirect on" + "enabled on"
     # (NO "redirected" — falla en gnu-tools 14.x / CubeIDE 2.x)
     rt = max(600, int(remotetimeout))
+    hz = max(100_000, min(int(swd_freq_hz), MAX_SWD_FREQ_HZ))
     return [
         "set confirm off",
         "set pagination off",
@@ -180,7 +183,7 @@ def _session_preamble(
         f"cd {_posix(tmp)}",
         f'echo >>> conectando {port}',
         f"target extended-remote {port}",
-        f"monitor frequency {BMP_SWD_FREQ_HZ}",
+        f"monitor frequency {hz}",
         "monitor swdp_scan",
         "attach 1",
         "monitor halt",
@@ -195,15 +198,17 @@ def program_external(
     stldr: Path,
     external_hex: Path,
     log: LogFn,
+    swd_freq_hz: int = DEFAULT_SWD_FREQ_HZ,
 ) -> bool:
     from intelhex import IntelHex
 
     stldr = stldr.resolve()
     external_hex = external_hex.resolve()
+    swd_freq_hz = max(100_000, min(int(swd_freq_hz), MAX_SWD_FREQ_HZ))
 
     log(
         f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} "
-        f"(SWD {BMP_SWD_FREQ_HZ} Hz + SectorErase + tbreak)"
+        f"(SWD {swd_freq_hz} Hz + SectorErase + tbreak)"
     )
     info = _elf_info(stldr)
     log(f"STLDR entry=0x{info['entry']:08X}" if info["entry"] else "STLDR sin entry")
@@ -289,7 +294,9 @@ def program_external(
 
     # --- Fase 1: solo Init (fail-fast si el trampolín no vuelve) ---
     log("=== Fase 1/4: Init (timeout 120s) ===")
-    lines = _session_preamble(tmp, port, restore_ram, "gdb_init.log")
+    lines = _session_preamble(
+        tmp, port, restore_ram, "gdb_init.log", swd_freq_hz=swd_freq_hz
+    )
     _append_call(
         lines,
         func=int(init_addr),
@@ -322,7 +329,12 @@ def program_external(
             "No canceles; el heartbeat «GDB sigue» es normal."
         )
         lines = _session_preamble(
-            tmp, port, restore_ram, "gdb_erase.log", remotetimeout=erase_timeout
+            tmp,
+            port,
+            restore_ram,
+            "gdb_erase.log",
+            remotetimeout=erase_timeout,
+            swd_freq_hz=swd_freq_hz,
         )
         _append_call(
             lines,
@@ -374,7 +386,12 @@ def program_external(
                 f"{len(batch)} sectores (timeout {erase_timeout}s) ---"
             )
             lines = _session_preamble(
-                tmp, port, restore_ram, log_name, remotetimeout=erase_timeout
+                tmp,
+                port,
+                restore_ram,
+                log_name,
+                remotetimeout=erase_timeout,
+                swd_freq_hz=swd_freq_hz,
             )
             _append_call(
                 lines,
@@ -426,7 +443,12 @@ def program_external(
         log_name = f"gdb_write_{batch_i:03d}.log"
         write_timeout = max(300, len(batch) * 20)
         lines = _session_preamble(
-            tmp, port, restore_ram, log_name, remotetimeout=write_timeout
+            tmp,
+            port,
+            restore_ram,
+            log_name,
+            remotetimeout=write_timeout,
+            swd_freq_hz=swd_freq_hz,
         )
         _append_call(
             lines,
@@ -463,6 +485,10 @@ def program_external(
         )
         if not ok:
             log(f"ERROR en lote Write {batch_i}/{n_batches}")
+            log(
+                "Si ves «Remote connection closed» / lockup: bajá la "
+                "velocidad SWD en la GUI (p. ej. 2 MHz o 3.3 MHz) y reintentá."
+            )
             return False
 
     # --- Fase 4: verificar primeras palabras + reset para arrancar la app ---
@@ -475,7 +501,9 @@ def program_external(
         "Esperado @0x90000000: "
         + " ".join(f"0x{w:08X}" for w in exp_words)
     )
-    lines = _session_preamble(tmp, port, restore_ram, "gdb_verify.log")
+    lines = _session_preamble(
+        tmp, port, restore_ram, "gdb_verify.log", swd_freq_hz=swd_freq_hz
+    )
     _append_call(
         lines,
         func=int(init_addr),

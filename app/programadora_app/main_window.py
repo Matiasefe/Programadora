@@ -28,6 +28,16 @@ from .gdb_find import find_gdb
 from .probe import list_ports, pick_gdb_port
 
 
+# (Hz, etiqueta GUI). Default = default BMP (~3.3 MHz), estable en Write largo.
+SWD_FREQ_CHOICES: list[tuple[int, str]] = [
+    (1_000_000, "1 MHz — más estable / más lento"),
+    (2_000_000, "2 MHz"),
+    (3_272_727, "3.3 MHz — default BMP (recomendado)"),
+    (4_000_000, "4 MHz"),
+    (6_000_000, "6 MHz — máx. F103 (puede cortar en Riverdi grande)"),
+]
+
+
 class FlashWorker(QObject):
     log = pyqtSignal(str)
     finished = pyqtSignal(bool)
@@ -40,6 +50,7 @@ class FlashWorker(QObject):
         gdb_path: str | None,
         erase: bool,
         run_after: bool,
+        swd_freq_hz: int,
     ):
         super().__init__()
         self.hex_path = hex_path
@@ -48,6 +59,7 @@ class FlashWorker(QObject):
         self.gdb_path = gdb_path
         self.erase = erase
         self.run_after = run_after
+        self.swd_freq_hz = swd_freq_hz
         self._abort = False
 
     def request_abort(self) -> None:
@@ -65,6 +77,7 @@ class FlashWorker(QObject):
                 gdb_path=self.gdb_path or None,
                 erase=self.erase,
                 run_after=self.run_after,
+                swd_freq_hz=self.swd_freq_hz,
                 log=lambda m: self.log.emit(m),
             )
         except Exception as exc:  # noqa: BLE001
@@ -131,22 +144,35 @@ class MainWindow(QMainWindow):
         fg.addWidget(QLabel("Familia (informativo):"), 2, 0)
         fg.addWidget(self.family, 2, 1)
 
+        self.swd_freq = QComboBox()
+        for hz, label in SWD_FREQ_CHOICES:
+            self.swd_freq.addItem(label, hz)
+        # Default: 3.3 MHz (estable; 6 MHz cortó Write en Riverdi ~18 MB)
+        idx_default = next(
+            (i for i, (hz, _) in enumerate(SWD_FREQ_CHOICES) if hz == 3_272_727),
+            2,
+        )
+        self.swd_freq.setCurrentIndex(idx_default)
+        fg.addWidget(QLabel("Velocidad SWD:"), 3, 0)
+        fg.addWidget(self.swd_freq, 3, 1)
+
         self.erase_cb = QCheckBox("Borrar flash interna (erase_mass) antes de grabar")
         self.erase_cb.setChecked(True)
-        fg.addWidget(self.erase_cb, 3, 0, 1, 3)
+        fg.addWidget(self.erase_cb, 4, 0, 1, 3)
 
         self.run_after_cb = QCheckBox("Run after programming (reset y arrancar la app)")
         self.run_after_cb.setChecked(True)
-        fg.addWidget(self.run_after_cb, 4, 0, 1, 3)
+        fg.addWidget(self.run_after_cb, 5, 0, 1, 3)
 
         hint = QLabel(
             "F4/F1/F7: .hex/.elf y .stldr vacío + NRST cableado.\n"
             "Sin .stldr: solo flash interna (F1…H7/U5).\n"
             "Con .stldr: si el HEX tiene región 0x90000000, se programa la QSPI/OSPI "
-            "ejecutando el loader en el destino (sin CubeProgrammer)."
+            "ejecutando el loader en el destino (sin CubeProgrammer).\n"
+            "Si falla con «Remote connection closed» en Write: bajá SWD a 2 o 3.3 MHz."
         )
         hint.setWordWrap(True)
-        fg.addWidget(hint, 5, 0, 1, 3)
+        fg.addWidget(hint, 6, 0, 1, 3)
         layout.addWidget(files_box)
 
         # --- GDB ---
@@ -277,8 +303,12 @@ class MainWindow(QMainWindow):
 
         self.btn_flash.setEnabled(False)
         self.progress.setVisible(True)
+        swd_hz = int(self.swd_freq.currentData() or 3_272_727)
         self.append_log("")
-        self.append_log(f"=== Programar | familia={self.family.currentText()} ===")
+        self.append_log(
+            f"=== Programar | familia={self.family.currentText()} | "
+            f"SWD={swd_hz} Hz ==="
+        )
 
         thread = QThread(self)
         worker = FlashWorker(
@@ -288,6 +318,7 @@ class MainWindow(QMainWindow):
             gdb_path=gdb,
             erase=self.erase_cb.isChecked(),
             run_after=self.run_after_cb.isChecked(),
+            swd_freq_hz=swd_hz,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
