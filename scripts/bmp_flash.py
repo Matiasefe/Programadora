@@ -233,9 +233,14 @@ def flash_hex(
     cmds = [
         "set confirm off",
         "set pagination off",
+        "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
+        # BMD reciente: connect_rst; BMP antiguo: connect_srst
+        "monitor connect_rst enable",
+        "monitor connect_srst enable",
         "monitor swdp_scan",
         "attach 1",
+        "monitor halt",
     ]
     if erase:
         cmds.append("monitor erase_mass")
@@ -248,6 +253,9 @@ def flash_hex(
         cmds.append("compare-sections")
     if reset:
         cmds.append("monitor reset")
+        cmds.append("set $sp = *(unsigned int*)0x08000000")
+        cmds.append("set $pc = *(unsigned int*)0x08000004")
+        cmds.append("set *(unsigned int*)0xE000EDF0 = 0xA05F0001")
     cmds.append("detach")
     cmds.append("quit")
 
@@ -273,7 +281,10 @@ def dump_flash(gdb: str, port: str) -> int:
     cmds = [
         "set confirm off",
         "set pagination off",
+        "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
+        "monitor connect_rst enable",
+        "monitor connect_srst enable",
         "monitor swdp_scan",
         "attach 1",
         "x/8xw 0x08000000",

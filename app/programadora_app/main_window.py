@@ -140,6 +140,7 @@ class MainWindow(QMainWindow):
         fg.addWidget(self.run_after_cb, 4, 0, 1, 3)
 
         hint = QLabel(
+            "F4/F1/F7: .hex/.elf y .stldr vacío + NRST cableado.\n"
             "Sin .stldr: solo flash interna (F1…H7/U5).\n"
             "Con .stldr: si el HEX tiene región 0x90000000, se programa la QSPI/OSPI "
             "ejecutando el loader en el destino (sin CubeProgrammer)."

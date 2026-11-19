@@ -1,0 +1,29 @@
+# ESTADO_PROYECTO
+
+## Resumen
+
+Programadora **STM32F103** + **Black Magic Probe** + app PyQt5.  
+Programa flash interna F1…H7/U5 y Riverdi con `.stldr` (QSPI/OSPI) **sin** CubeProgrammer.
+
+## Logrado
+
+- Riverdi (U5) programada OK (HEX correcto del proyecto + runner STLDR v9).
+- Flash interna U5 verificada.
+- Firmware Blue Pill y PCB propia (PB13/PB14/PB5) en `firmware/`.
+- Repo reorganizado en la **raíz** (sin carpeta `Programadora-main/`).
+- Flasher F4 endurecido: `connect_rst` + `connect_srst`, `erase_mass` en sesión aparte, verify post-load, hints.
+
+## Flasheo F4 (checklist si falla)
+
+1. Campo **`.stldr` vacío** (solo Riverdi).
+2. `.hex`/`.elf` del proyecto **F4** (Clean + Build, fecha actual).
+3. Cables: **SWDIO, SWCLK, GND, NRST** + alimentación 3.3 V del F4.
+4. Firmware de sonda acorde al hardware (Blue Pill ≠ PCB propia).
+5. En el log: `Target detectado: STM32F4…` y `Post-load @0x08000000` ≠ `FFFFFFFF`.
+6. Si `erase_mass` da *packet error*: desmarcar «Borrar flash» y reintentar; power-cycle del destino.
+
+## Pendiente
+
+- Validar Riverdi H7 (loader en AXI `0x2400…`).
+- Confirmar en PCB si `PRESET` está aislado del NRST del F103.
+- Confirmación del usuario con log F4 tras este flasher.
