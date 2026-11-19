@@ -15,6 +15,13 @@ from . import stldr_runner
 
 LogFn = Callable[[str], None]
 
+# Tope medido en la sonda F103 (pedí 8 MHz y BMP clampa a 6 MHz).
+BMP_SWD_FREQ_HZ = 6_000_000
+
+
+def _swd_freq_cmds() -> list[str]:
+    return [f"monitor frequency {BMP_SWD_FREQ_HZ}"]
+
 
 def flash(
     hex_path: Path,
@@ -39,6 +46,7 @@ def flash(
 
     port = normalize_port(port)
     log(f"Puerto: {port}")
+    log(f"SWD: {BMP_SWD_FREQ_HZ} Hz (monitor frequency en cada sesión GDB)")
 
     suffix = hex_path.suffix.lower()
     if suffix == ".elf":
@@ -149,6 +157,7 @@ def _run_after_programming(gdb: str, port: str, log: LogFn) -> None:
         "set pagination off",
         "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
+        *_swd_freq_cmds(),
         "monitor connect_rst disable",
         "monitor swdp_scan",
         "attach 1",
@@ -207,6 +216,7 @@ def _flash_internal(
             "set pagination off",
             "set mem inaccessible-by-default off",
             f"target extended-remote {port}",
+            *_swd_freq_cmds(),
             *_connect_under_reset_cmds(),
             "monitor swdp_scan",
             "attach 1",
@@ -234,6 +244,7 @@ def _flash_internal(
         "set pagination off",
         "set mem inaccessible-by-default off",
         f"target extended-remote {port}",
+        *_swd_freq_cmds(),
         *_connect_under_reset_cmds(),
         "monitor swdp_scan",
         "attach 1",

@@ -17,7 +17,7 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 10
+STLDR_RUNNER_VERSION = 11
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
@@ -26,6 +26,8 @@ RAM_MIN = 0x20000000
 WRITE_BATCH = 64  # bloques por sesión GDB (menos = más feedback / reconnect)
 # SectorErase por sesión GDB (imágenes grandes: no meter 15k continues en un script)
 SECTOR_ERASE_BATCH = 128
+# Tope SWD medido en la sonda F103 (BMP clampa 8→6 MHz)
+BMP_SWD_FREQ_HZ = 6_000_000
 
 
 def _fmt_bytes(n: int) -> str:
@@ -178,6 +180,7 @@ def _session_preamble(
         f"cd {_posix(tmp)}",
         f'echo >>> conectando {port}',
         f"target extended-remote {port}",
+        f"monitor frequency {BMP_SWD_FREQ_HZ}",
         "monitor swdp_scan",
         "attach 1",
         "monitor halt",
@@ -198,7 +201,10 @@ def program_external(
     stldr = stldr.resolve()
     external_hex = external_hex.resolve()
 
-    log(f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} (live log + SectorErase + tbreak)")
+    log(
+        f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} "
+        f"(SWD {BMP_SWD_FREQ_HZ} Hz + SectorErase + tbreak)"
+    )
     info = _elf_info(stldr)
     log(f"STLDR entry=0x{info['entry']:08X}" if info["entry"] else "STLDR sin entry")
     for name, addr in sorted(info["symbols"].items()):

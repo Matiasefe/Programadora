@@ -66,7 +66,8 @@ app/
 ## Notas
 
 - La familia del combo es **informativa**; BMP identifica el MCU por SWD.
-- El flujo `.stldr` (runner v10) restaura el loader en RAM e invoca `Init` / `Write` / `MassErase` por trampolín BKPT (no usa `call` de GDB). Scratch/stack se calculan encima del segmento RAM del `.stldr`. Si un Riverdi concreto falla, revisá el log (`RET_Init`, HardFault) y que el `.stldr` sea el del módulo.
+- El flujo `.stldr` (runner v11) restaura el loader en RAM e invoca `Init` / `Write` / `MassErase` por trampolín BKPT (no usa `call` de GDB). Scratch/stack se calculan encima del segmento RAM del `.stldr`. Si un Riverdi concreto falla, revisá el log (`RET_Init`, HardFault) y que el `.stldr` sea el del módulo.
+- Cada sesión GDB hace `monitor frequency 6000000` (máximo estable medido en la sonda F103).
 - HEX externos grandes (~60 MB): `MassErase` puede llevar **45–120 min**; el timeout escala con el tamaño. No canceles mientras el log diga `GDB sigue`. La Write también es larga (miles de bloques de 4 KiB por SWD).
 - Pinout de tu PCB: ver `docs/04-placa-propia-pinout.md`.
 
