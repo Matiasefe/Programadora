@@ -1,0 +1,8 @@
+upstream=https://codeberg.org/blackmagic-debug/blackmagic
+probe=bluepill
+targets=cortexm,stm
+bmd_bootloader=true
+board=STM32F103CBT6 custom (UC55) + SRV05-4 (UC56)
+pinout=SWDIO=PB14 SWCLK=PB13 NRST=PB5 LED=PA9 USB=PA11/PA12 VREF=PA0
+notes=SWIM PB8/PB9 unused for STM32 SWD; verify NRST GPIO if PRESET!=PB5
+built=2026-11-18

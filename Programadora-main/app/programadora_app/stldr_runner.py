@@ -1,0 +1,513 @@
+"""
+Ejecutar un External Loader (.stldr) sobre el destino vía GDB + BMP.
+
+El .stldr es un ELF con código en RAM. GDB `call` falla en remoto BMP, así que
+se invocan Init/Write/Erase con LR→breakpoint + PC Thumb + `continue`.
+
+Salida en vivo: GDB logging a archivo + heartbeat (si no, parece colgado).
+"""
+
+from __future__ import annotations
+
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from typing import Callable
+
+LogFn = Callable[[str], None]
+
+STLDR_RUNNER_VERSION = 9
+# NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
+SECTOR_ERASE_STEP = 0x1000
+
+CHUNK_SIZE = 4096
+RAM_MIN = 0x20000000
+WRITE_BATCH = 64  # bloques por sesión GDB (menos = más feedback / reconnect)
+
+
+def _posix(path: Path) -> str:
+    return str(path.resolve()).replace("\\", "/")
+
+
+def _thumb(addr: int) -> int:
+    return int(addr) | 1
+
+
+def _align_up(addr: int, align: int) -> int:
+    return (addr + align - 1) & ~(align - 1)
+
+
+def _write_gdb_script(path: Path, lines: list[str]) -> None:
+    text = "\n".join(lines) + "\n"
+    with path.open("w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def _elf_info(stldr: Path) -> dict:
+    from elftools.elf.elffile import ELFFile
+
+    info: dict = {"segments": [], "symbols": {}, "entry": None}
+    with stldr.open("rb") as f:
+        elf = ELFFile(f)
+        info["entry"] = elf.header["e_entry"]
+        for seg in elf.iter_segments():
+            if seg["p_type"] != "PT_LOAD" or seg["p_filesz"] == 0:
+                continue
+            info["segments"].append(
+                {
+                    "vaddr": int(seg["p_vaddr"]),
+                    "filesz": int(seg["p_filesz"]),
+                    "data": bytes(seg.data()),
+                }
+            )
+        symtab = elf.get_section_by_name(".symtab")
+        if symtab is not None:
+            for sym in symtab.iter_symbols():
+                name = sym.name
+                if name in {
+                    "Init",
+                    "Write",
+                    "Read",
+                    "SectorErase",
+                    "MassErase",
+                    "CheckSum",
+                    "StorageInfo",
+                }:
+                    info["symbols"][name] = int(sym["st_value"])
+    return info
+
+
+def _pick_ram_layout(ram_segs: list[dict]) -> tuple[int, int, int]:
+    """scratch, trampoline (halfword), stack — por encima del loader."""
+    base = min(int(s["vaddr"]) for s in ram_segs)
+    end = max(int(s["vaddr"]) + int(s["filesz"]) for s in ram_segs)
+    end = _align_up(end, 16)
+
+    scratch = _align_up(end + 0x100, 32)
+    trampoline = _align_up(scratch + CHUNK_SIZE + 0x40, 2)
+    stack = _align_up(trampoline + 0x4000, 8)
+
+    if 0x24000000 <= base < 0x25000000:
+        stack = max(stack, 0x24080000)
+    elif 0x20000000 <= base < 0x24000000:
+        dtcm_top = 0x20020000
+        if trampoline + 0x1000 < dtcm_top:
+            stack = max(stack, trampoline + 0x4000)
+            stack = min(_align_up(stack, 8), dtcm_top)
+        else:
+            stack = max(stack, 0x20080000)
+
+    return scratch, trampoline, stack
+
+
+def _append_call(
+    lines: list[str],
+    *,
+    func: int,
+    trampoline: int,
+    stack: int,
+    label: str,
+    r0: int | None = None,
+    r1: int | None = None,
+    r2: int | None = None,
+) -> None:
+    """Invocar Thumb en RAM: breakpoint en trampolín + continue."""
+    lines.append(f'echo >>> CALL {label} (esperando retorno)...')
+    # Breakpoint de GDB en la dirección de retorno (más fiable que BKPT solo)
+    lines.append("delete breakpoints")
+    lines.append(f"tbreak *0x{trampoline:X}")
+    if r0 is not None:
+        lines.append(f"set $r0 = 0x{int(r0):X}")
+    if r1 is not None:
+        lines.append(f"set $r1 = 0x{int(r1):X}")
+    if r2 is not None:
+        lines.append(f"set $r2 = 0x{int(r2):X}")
+    lines.append(f"set $sp = 0x{stack:X}")
+    lines.append(f"set $lr = 0x{_thumb(trampoline):X}")
+    lines.append("set $xpsr = 0x01000000")
+    lines.append(f"set $pc = 0x{_thumb(func):X}")
+    lines.append("continue")
+    lines.append(f'printf "RET_{label} 0x%x\\n", $r0')
+
+
+def _session_preamble(
+    tmp: Path,
+    port: str,
+    restore_ram: list[str],
+    log_name: str,
+) -> list[str]:
+    # GDB reciente: "set logging redirect on" + "enabled on"
+    # (NO "redirected" — falla en gnu-tools 14.x / CubeIDE 2.x)
+    return [
+        "set confirm off",
+        "set pagination off",
+        "set remotetimeout 600",
+        f"set logging file {_posix(tmp / log_name)}",
+        "set logging overwrite on",
+        "set logging redirect on",
+        "set logging enabled on",
+        f"cd {_posix(tmp)}",
+        f'echo >>> conectando {port}',
+        f"target extended-remote {port}",
+        "monitor swdp_scan",
+        "attach 1",
+        "monitor halt",
+        *restore_ram,
+        'echo >>> loader en RAM OK',
+    ]
+
+
+def program_external(
+    gdb: str,
+    port: str,
+    stldr: Path,
+    external_hex: Path,
+    log: LogFn,
+) -> bool:
+    from intelhex import IntelHex
+
+    stldr = stldr.resolve()
+    external_hex = external_hex.resolve()
+
+    log(f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} (live log + SectorErase + tbreak)")
+    info = _elf_info(stldr)
+    log(f"STLDR entry=0x{info['entry']:08X}" if info["entry"] else "STLDR sin entry")
+    for name, addr in sorted(info["symbols"].items()):
+        log(f"  símbolo {name} @ 0x{addr:08X}")
+
+    if "Write" not in info["symbols"]:
+        log("ERROR: el .stldr no exporta Write().")
+        return False
+
+    ram_segs = [s for s in info["segments"] if s["vaddr"] >= RAM_MIN]
+    skipped = [s for s in info["segments"] if s["vaddr"] < RAM_MIN]
+    for s in skipped:
+        log(f"  omitido seg lma=0x{s['vaddr']:08X} size={s['filesz']} (no es RAM)")
+    if not ram_segs:
+        log("ERROR: no hay segmentos PT_LOAD en RAM.")
+        return False
+
+    scratch, trampoline, stack_addr = _pick_ram_layout(ram_segs)
+    log(
+        f"Layout RAM: scratch=0x{scratch:08X} trampoline=0x{trampoline:08X} "
+        f"sp=0x{stack_addr:08X}"
+    )
+
+    tmp = Path(tempfile.mkdtemp(prefix="stldr_"))
+    log(f"Temp: {tmp}")
+
+    restore_ram: list[str] = []
+    for i, seg in enumerate(ram_segs):
+        name = f"seg{i}.bin"
+        (tmp / name).write_bytes(seg["data"])
+        restore_ram.append(f"restore {name} binary 0x{seg['vaddr']:X}")
+        log(f"  seg RAM {i}: {seg['filesz']} bytes → 0x{seg['vaddr']:08X} ({name})")
+
+    log("Leyendo HEX externo…")
+    ih = IntelHex(str(external_hex))
+    addrs = ih.addresses()
+    if not addrs:
+        log("No hay datos externos.")
+        return True
+
+    min_a, max_a = min(addrs), max(addrs)
+    total = max_a - min_a + 1
+    log(f"Externa HEX: 0x{min_a:08X} .. 0x{max_a:08X} (span {total})")
+
+    log("Generando imagen binaria…")
+    blob = bytes(ih.tobinarray(start=min_a, size=total))
+
+    chunks_dir = tmp / "chunks"
+    chunks_dir.mkdir()
+    chunk_files: list[tuple[int, str, int]] = []
+    offset = 0
+    idx = 0
+    log(f"Partiendo en bloques de {CHUNK_SIZE}…")
+    while offset < len(blob):
+        piece = blob[offset : offset + CHUNK_SIZE]
+        rel = f"chunks/c{idx:05d}.bin"
+        (tmp / rel).write_bytes(piece)
+        chunk_files.append((min_a + offset, rel, len(piece)))
+        idx += 1
+        offset += CHUNK_SIZE
+        if idx == 1 or idx % 64 == 0 or offset >= len(blob):
+            log(f"  preparados {idx} bloques ({min(offset, len(blob))}/{len(blob)})")
+
+    log(f"Total Write: {len(chunk_files)}")
+
+    init_addr = info["symbols"].get("Init", info["entry"])
+    write_addr = info["symbols"]["Write"]
+    mass_addr = info["symbols"].get("MassErase")
+    sector_addr = info["symbols"].get("SectorErase")
+
+    if init_addr is None:
+        log("ERROR: no hay Init ni entry en el .stldr.")
+        return False
+
+    # --- Fase 1: solo Init (fail-fast si el trampolín no vuelve) ---
+    log("=== Fase 1/3: Init (timeout 120s) ===")
+    lines = _session_preamble(tmp, port, restore_ram, "gdb_init.log")
+    _append_call(
+        lines,
+        func=int(init_addr),
+        trampoline=trampoline,
+        stack=stack_addr,
+        label="Init",
+    )
+    lines.extend(["detach", "quit"])
+    script = tmp / "phase_init.gdb"
+    _write_gdb_script(script, lines)
+    if not _run_gdb_live(
+        gdb, script, cwd=tmp, log_name="gdb_init.log", log=log, timeout_s=120
+    ):
+        log(
+            "ERROR: Init no volvió a tiempo. "
+            "La sonda/trampolín no está ejecutando el .stldr (o HardFault)."
+        )
+        return False
+    log("Init OK — seguimos")
+
+    # --- Fase 2: Init + erase fiable del rango ---
+    # Un solo SectorErase(min,max) a veces no borra todo el rango en estos
+    # loaders → Write “OK” pero datos corruptos → pantalla negra.
+    log("=== Fase 2/4: Erase ===")
+    lines = _session_preamble(tmp, port, restore_ram, "gdb_erase.log")
+    _append_call(
+        lines,
+        func=int(init_addr),
+        trampoline=trampoline,
+        stack=stack_addr,
+        label="Init",
+    )
+    if mass_addr is not None:
+        log(
+            "MassErase() del chip OSPI/QSPI — puede tardar varios minutos; "
+            "es lo más fiable para Riverdi"
+        )
+        _append_call(
+            lines,
+            func=int(mass_addr),
+            trampoline=trampoline,
+            stack=stack_addr,
+            label="MassErase",
+        )
+        erase_timeout = 1200
+    elif sector_addr is not None:
+        nsec = 0
+        a = min_a & ~(SECTOR_ERASE_STEP - 1)
+        log(
+            f"SectorErase sector a sector 0x{SECTOR_ERASE_STEP:X} "
+            f"desde 0x{a:X} hasta 0x{max_a:X}"
+        )
+        while a <= max_a:
+            end_a = min(a + SECTOR_ERASE_STEP - 1, max_a)
+            _append_call(
+                lines,
+                func=int(sector_addr),
+                trampoline=trampoline,
+                stack=stack_addr,
+                label=f"Sec{nsec}",
+                r0=a,
+                r1=end_a,
+            )
+            if nsec % 16 == 0:
+                lines.append(f"echo ERASE_SEC {nsec}")
+            a += SECTOR_ERASE_STEP
+            nsec += 1
+        erase_timeout = max(600, nsec * 8)
+        log(f"Total SectorErase: {nsec}")
+    else:
+        log("AVISO: sin erase en el loader — se intenta Write directo")
+        erase_timeout = 120
+    lines.extend(["detach", "quit"])
+    script = tmp / "phase_erase.gdb"
+    _write_gdb_script(script, lines)
+    if not _run_gdb_live(
+        gdb,
+        script,
+        cwd=tmp,
+        log_name="gdb_erase.log",
+        log=log,
+        timeout_s=erase_timeout,
+    ):
+        log("ERROR en fase Erase")
+        return False
+    log("Erase OK — seguimos")
+
+    # --- Fase 3: Writes por lotes ---
+    log(f"=== Fase 3/4: Write ({len(chunk_files)} bloques, lotes de {WRITE_BATCH}) ===")
+    for batch_start in range(0, len(chunk_files), WRITE_BATCH):
+        batch = chunk_files[batch_start : batch_start + WRITE_BATCH]
+        batch_i = batch_start // WRITE_BATCH + 1
+        n_batches = (len(chunk_files) + WRITE_BATCH - 1) // WRITE_BATCH
+        log(
+            f"--- Lote {batch_i}/{n_batches}: "
+            f"bloques {batch_start}..{batch_start + len(batch) - 1} ---"
+        )
+        log_name = f"gdb_write_{batch_i:03d}.log"
+        lines = _session_preamble(tmp, port, restore_ram, log_name)
+        _append_call(
+            lines,
+            func=int(init_addr),
+            trampoline=trampoline,
+            stack=stack_addr,
+            label="Init",
+        )
+        for j, (waddr, rel, size) in enumerate(batch):
+            global_i = batch_start + j
+            lines.append(f"restore {rel} binary 0x{scratch:X}")
+            _append_call(
+                lines,
+                func=int(write_addr),
+                trampoline=trampoline,
+                stack=stack_addr,
+                label=f"W{global_i}",
+                r0=waddr,
+                r1=size,
+                r2=scratch,
+            )
+            if global_i % 8 == 0:
+                lines.append(f"echo PROG {global_i}/{len(chunk_files)}")
+        lines.extend(["detach", "quit"])
+        script = tmp / f"phase_write_{batch_i:03d}.gdb"
+        _write_gdb_script(script, lines)
+        ok = _run_gdb_live(
+            gdb,
+            script,
+            cwd=tmp,
+            log_name=log_name,
+            log=log,
+            timeout_s=max(300, len(batch) * 15),
+        )
+        if not ok:
+            log(f"ERROR en lote Write {batch_i}/{n_batches}")
+            return False
+
+    # --- Fase 4: verificar primeras palabras + reset para arrancar la app ---
+    log("=== Fase 4/4: Verificar 0x90000000 + reset ===")
+    expect = blob[:16]
+    exp_words = [
+        int.from_bytes(expect[i : i + 4], "little") for i in range(0, 16, 4)
+    ]
+    log(
+        "Esperado @0x90000000: "
+        + " ".join(f"0x{w:08X}" for w in exp_words)
+    )
+    lines = _session_preamble(tmp, port, restore_ram, "gdb_verify.log")
+    _append_call(
+        lines,
+        func=int(init_addr),
+        trampoline=trampoline,
+        stack=stack_addr,
+        label="Init",
+    )
+    # Tras Init el loader suele dejar el OSPI en memory-mapped
+    lines.append("x/4xw 0x90000000")
+    lines.append("detach")
+    lines.append("quit")
+    script = tmp / "phase_verify.gdb"
+    _write_gdb_script(script, lines)
+    if not _run_gdb_live(
+        gdb, script, cwd=tmp, log_name="gdb_verify.log", log=log, timeout_s=180
+    ):
+        log("AVISO: verify falló; la Write puede haber andado igual")
+    else:
+        log(
+            "Compará el 'x/4xw 0x90000000' de arriba con los bytes esperados. "
+            "Si ves ffffffff o valores distintos, la externa no quedó bien."
+        )
+
+    log("Programación externa OK (GDB).")
+    return True
+
+
+def _run_gdb_live(
+    gdb: str,
+    script: Path,
+    cwd: Path,
+    log_name: str,
+    log: LogFn,
+    timeout_s: int,
+) -> bool:
+    """Lanza GDB y muestra gdb_*.log en vivo + heartbeat cada 10s."""
+    log_path = cwd / log_name
+    if log_path.exists():
+        try:
+            log_path.unlink()
+        except OSError:
+            pass
+
+    args = [gdb, "-nx", "--batch", "--quiet", "-x", _posix(script)]
+    log(f"Ejecutando: {script.name} (timeout {timeout_s}s) — mirá mensajes >>> / RET_")
+    start = time.monotonic()
+    try:
+        proc = subprocess.Popen(
+            args,
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except OSError as exc:
+        log(f"ERROR al lanzar GDB: {exc}")
+        return False
+
+    pos = 0
+    last_hb = start
+    combined: list[str] = []
+
+    while True:
+        rc = proc.poll()
+        if log_path.is_file():
+            try:
+                data = log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                data = ""
+            if len(data) > pos:
+                chunk = data[pos:]
+                pos = len(data)
+                for ln in chunk.splitlines():
+                    if ln.strip():
+                        log(ln)
+                        combined.append(ln)
+        now = time.monotonic()
+        if now - last_hb >= 10 and rc is None:
+            log(f"... GDB sigue ({int(now - start)}s) — si está en Erase/Init es normal")
+            last_hb = now
+        if rc is not None:
+            # drenar stdout por si logging falló
+            try:
+                rest = proc.stdout.read() if proc.stdout else ""
+            except Exception:  # noqa: BLE001
+                rest = ""
+            if rest:
+                for ln in rest.splitlines():
+                    if ln.strip():
+                        log(ln)
+                        combined.append(ln)
+            break
+        if now - start > timeout_s:
+            log(f"ERROR: timeout {timeout_s}s — matando GDB")
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return False
+        time.sleep(0.2)
+
+    if proc.returncode != 0:
+        log(f"GDB código {proc.returncode}")
+        return False
+
+    joined = "\n".join(combined)
+    if "HardFault" in joined or "fatal signal" in joined.lower():
+        log("ERROR: HardFault / señal fatal en GDB")
+        return False
+    # Init/Erase/Write deben haber imprimido al menos un RET_
+    if "RET_" not in joined and ">>> CALL" in joined:
+        log("ERROR: no hubo RET_ — el continue no volvió del loader")
+        return False
+    return True

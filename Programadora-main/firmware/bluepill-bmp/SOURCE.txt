@@ -1,0 +1,8 @@
+upstream=https://codeberg.org/blackmagic-debug/blackmagic
+commit=3424d0a02b036ad031c3abb36f56574142195216
+probe=bluepill
+targets=cortexm,stm
+bmd_bootloader=true
+rtt_support=false
+pinout=SWDIO=PB14 SWCLK=PA5 NRST=PB1 LED=PC13 UART=PA2/PA3
+built=2026-11-18T17:46:38Z
