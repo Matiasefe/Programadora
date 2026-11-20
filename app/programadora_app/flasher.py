@@ -34,6 +34,8 @@ def flash(
     erase: bool = True,
     run_after: bool = True,
     swd_freq_hz: int = DEFAULT_SWD_FREQ_HZ,
+    chunk_size: int = stldr_runner.CHUNK_SIZE_DEFAULT,
+    batch_pause_s: float = stldr_runner.WRITE_BATCH_PAUSE_S,
     log: LogFn | None = None,
 ) -> bool:
     log = log or print
@@ -136,6 +138,8 @@ def flash(
             external_hex=split.external_path,
             log=log,
             swd_freq_hz=swd_freq_hz,
+            chunk_size=chunk_size,
+            batch_pause_s=batch_pause_s,
         )
         if not ok:
             return False

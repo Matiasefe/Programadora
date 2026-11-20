@@ -66,9 +66,10 @@ app/
 ## Notas
 
 - La familia del combo es **informativa**; BMP identifica el MCU por SWD.
-- El flujo `.stldr` (runner v13) restaura el loader en RAM e invoca `Init` / `Write` / `MassErase` por trampolín BKPT (no usa `call` de GDB). Scratch/stack se calculan encima del segmento RAM del `.stldr`. Si un Riverdi concreto falla, revisá el log (`RET_Init`, HardFault) y que el `.stldr` sea el del módulo.
-- Combo **Velocidad SWD**: 1 / **2 (default)** / 3.3 / 4 / 6 MHz. Write en lotes de 16 + reintentos si `Remote connection closed`.
-- HEX externos grandes (~60 MB): `MassErase` puede llevar **45–120 min**; el timeout escala con el tamaño. No canceles mientras el log diga `GDB sigue`. La Write también es larga (miles de bloques de 4 KiB por SWD).
+- El flujo `.stldr` (runner v14) restaura el loader en RAM e invoca `Init` / `Write` / `MassErase` por trampolín BKPT. Scratch crece con el tamaño de Write (4/8/16 KiB).
+- Combos: **SWD** 1/2/3.3/4/6 MHz; **Tamaño Write** 4/8/16 KiB; **Pausa entre lotes** 0–1.5 s (no entre cada Write).
+- Riverdi grande tipico: SWD 2 MHz + 8 KiB + pausa 0.75 s. Si corta USB: más pausa o menos MHz; si el loader rechaza Write: 4 KiB.
+- HEX externos grandes: `MassErase` puede llevar **45–120 min**. No canceles mientras diga `GDB sigue`.
 - Pinout de tu PCB: ver `docs/04-placa-propia-pinout.md`.
 
 ## STM32F4 (flash interna)

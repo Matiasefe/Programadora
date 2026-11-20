@@ -37,6 +37,20 @@ SWD_FREQ_CHOICES: list[tuple[int, str]] = [
     (6_000_000, "6 MHz — máx. F103 (poco estable en Write largo)"),
 ]
 
+# Tamaño de cada Write al .stldr (más grande = menos continues GDB).
+CHUNK_SIZE_CHOICES: list[tuple[int, str]] = [
+    (4096, "4 KiB — más estable / más lento"),
+    (8192, "8 KiB — recomendado"),
+    (16384, "16 KiB — más rápido (probar)"),
+]
+
+BATCH_PAUSE_CHOICES: list[tuple[float, str]] = [
+    (0.0, "0 s — máximo ritmo"),
+    (0.35, "0.35 s entre lotes"),
+    (0.75, "0.75 s entre lotes (recomendado)"),
+    (1.5, "1.5 s — más estable"),
+]
+
 
 class FlashWorker(QObject):
     log = pyqtSignal(str)
@@ -51,6 +65,8 @@ class FlashWorker(QObject):
         erase: bool,
         run_after: bool,
         swd_freq_hz: int,
+        chunk_size: int,
+        batch_pause_s: float,
     ):
         super().__init__()
         self.hex_path = hex_path
@@ -60,6 +76,8 @@ class FlashWorker(QObject):
         self.erase = erase
         self.run_after = run_after
         self.swd_freq_hz = swd_freq_hz
+        self.chunk_size = chunk_size
+        self.batch_pause_s = batch_pause_s
         self._abort = False
 
     def request_abort(self) -> None:
@@ -78,6 +96,8 @@ class FlashWorker(QObject):
                 erase=self.erase,
                 run_after=self.run_after,
                 swd_freq_hz=self.swd_freq_hz,
+                chunk_size=self.chunk_size,
+                batch_pause_s=self.batch_pause_s,
                 log=lambda m: self.log.emit(m),
             )
         except Exception as exc:  # noqa: BLE001
@@ -156,24 +176,46 @@ class MainWindow(QMainWindow):
         fg.addWidget(QLabel("Velocidad SWD:"), 3, 0)
         fg.addWidget(self.swd_freq, 3, 1)
 
+        self.chunk_size = QComboBox()
+        for nbytes, label in CHUNK_SIZE_CHOICES:
+            self.chunk_size.addItem(label, nbytes)
+        idx_chunk = next(
+            (i for i, (n, _) in enumerate(CHUNK_SIZE_CHOICES) if n == 8192),
+            1,
+        )
+        self.chunk_size.setCurrentIndex(idx_chunk)
+        fg.addWidget(QLabel("Tamaño Write (QSPI):"), 4, 0)
+        fg.addWidget(self.chunk_size, 4, 1)
+
+        self.batch_pause = QComboBox()
+        for sec, label in BATCH_PAUSE_CHOICES:
+            self.batch_pause.addItem(label, sec)
+        idx_pause = next(
+            (i for i, (s, _) in enumerate(BATCH_PAUSE_CHOICES) if s == 0.75),
+            2,
+        )
+        self.batch_pause.setCurrentIndex(idx_pause)
+        fg.addWidget(QLabel("Pausa entre lotes:"), 5, 0)
+        fg.addWidget(self.batch_pause, 5, 1)
+
         self.erase_cb = QCheckBox("Borrar flash interna (erase_mass) antes de grabar")
         self.erase_cb.setChecked(True)
-        fg.addWidget(self.erase_cb, 4, 0, 1, 3)
+        fg.addWidget(self.erase_cb, 6, 0, 1, 3)
 
         self.run_after_cb = QCheckBox("Run after programming (reset y arrancar la app)")
         self.run_after_cb.setChecked(True)
-        fg.addWidget(self.run_after_cb, 5, 0, 1, 3)
+        fg.addWidget(self.run_after_cb, 7, 0, 1, 3)
 
         hint = QLabel(
             "F4/F1/F7: .hex/.elf y .stldr vacío + NRST cableado.\n"
             "Sin .stldr: solo flash interna (F1…H7/U5).\n"
-            "Con .stldr: si el HEX tiene región 0x90000000, se programa la QSPI/OSPI "
-            "ejecutando el loader en el destino (sin CubeProgrammer).\n"
-            "Si falla con «Remote connection closed» en Write: SWD 1–2 MHz, "
-            "cable corto / otro USB. La app reintenta lotes solos (STLDR v13)."
+            "Con .stldr: región 0x90000000 → QSPI/OSPI vía loader (sin Cube).\n"
+            "Riverdi grande: SWD 2 MHz + Write 8 KiB + pausa 0.75 s. "
+            "Si «Remote connection closed»: bajá SWD o subí la pausa; "
+            "si Write falla raro, probá 4 KiB."
         )
         hint.setWordWrap(True)
-        fg.addWidget(hint, 6, 0, 1, 3)
+        fg.addWidget(hint, 8, 0, 1, 3)
         layout.addWidget(files_box)
 
         # --- GDB ---
@@ -305,10 +347,12 @@ class MainWindow(QMainWindow):
         self.btn_flash.setEnabled(False)
         self.progress.setVisible(True)
         swd_hz = int(self.swd_freq.currentData() or 2_000_000)
+        chunk_n = int(self.chunk_size.currentData() or 8192)
+        pause_s = float(self.batch_pause.currentData() if self.batch_pause.currentData() is not None else 0.75)
         self.append_log("")
         self.append_log(
             f"=== Programar | familia={self.family.currentText()} | "
-            f"SWD={swd_hz} Hz ==="
+            f"SWD={swd_hz} Hz | chunk={chunk_n} B | pause={pause_s}s ==="
         )
 
         thread = QThread(self)
@@ -320,6 +364,8 @@ class MainWindow(QMainWindow):
             erase=self.erase_cb.isChecked(),
             run_after=self.run_after_cb.isChecked(),
             swd_freq_hz=swd_hz,
+            chunk_size=chunk_n,
+            batch_pause_s=pause_s,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)

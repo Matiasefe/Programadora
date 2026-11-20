@@ -17,22 +17,33 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 13
+STLDR_RUNNER_VERSION = 14
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
-CHUNK_SIZE = 4096
+# Tamaño de cada Write() al .stldr (scratch en RAM del destino).
+CHUNK_SIZE_DEFAULT = 8192
+CHUNK_SIZE_CHOICES = (4096, 8192, 16384)
 RAM_MIN = 0x20000000
 # Lotes chicos: con 64, Riverdi ~18 MB cortaba USB a mitad de sesión
 # ("Remote connection closed"). 16 = más reconnects, más estable.
 WRITE_BATCH = 16
 WRITE_BATCH_RETRIES = 4
+# Delay solo entre lotes (no entre cada Write): estabilidad USB sin frenar tanto.
 WRITE_BATCH_PAUSE_S = 0.75
 # SectorErase por sesión GDB (imágenes grandes: no meter 15k continues en un script)
 SECTOR_ERASE_BATCH = 128
 # Tope SWD medido en la sonda F103 (BMP clampa 8→6 MHz)
 MAX_SWD_FREQ_HZ = 6_000_000
 DEFAULT_SWD_FREQ_HZ = 2_000_000
+
+
+def _clamp_chunk_size(n: int) -> int:
+    n = int(n)
+    if n in CHUNK_SIZE_CHOICES:
+        return n
+    # redondear al choice más cercano
+    return min(CHUNK_SIZE_CHOICES, key=lambda c: abs(c - n))
 
 
 def _fmt_bytes(n: int) -> str:
@@ -111,14 +122,17 @@ def _elf_info(stldr: Path) -> dict:
     return info
 
 
-def _pick_ram_layout(ram_segs: list[dict]) -> tuple[int, int, int]:
+def _pick_ram_layout(
+    ram_segs: list[dict], chunk_size: int = CHUNK_SIZE_DEFAULT
+) -> tuple[int, int, int]:
     """scratch, trampoline (halfword), stack — por encima del loader."""
+    chunk_size = _clamp_chunk_size(chunk_size)
     base = min(int(s["vaddr"]) for s in ram_segs)
     end = max(int(s["vaddr"]) + int(s["filesz"]) for s in ram_segs)
     end = _align_up(end, 16)
 
     scratch = _align_up(end + 0x100, 32)
-    trampoline = _align_up(scratch + CHUNK_SIZE + 0x40, 2)
+    trampoline = _align_up(scratch + chunk_size + 0x40, 2)
     stack = _align_up(trampoline + 0x4000, 8)
 
     if 0x24000000 <= base < 0x25000000:
@@ -203,16 +217,21 @@ def program_external(
     external_hex: Path,
     log: LogFn,
     swd_freq_hz: int = DEFAULT_SWD_FREQ_HZ,
+    chunk_size: int = CHUNK_SIZE_DEFAULT,
+    batch_pause_s: float = WRITE_BATCH_PAUSE_S,
 ) -> bool:
     from intelhex import IntelHex
 
     stldr = stldr.resolve()
     external_hex = external_hex.resolve()
     swd_freq_hz = max(100_000, min(int(swd_freq_hz), MAX_SWD_FREQ_HZ))
+    chunk_size = _clamp_chunk_size(chunk_size)
+    batch_pause_s = max(0.0, float(batch_pause_s))
 
     log(
         f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} "
-        f"(SWD {swd_freq_hz} Hz + SectorErase + tbreak)"
+        f"(SWD {swd_freq_hz} Hz, chunk {chunk_size} B, "
+        f"pause lote {batch_pause_s:.2f}s)"
     )
     info = _elf_info(stldr)
     log(f"STLDR entry=0x{info['entry']:08X}" if info["entry"] else "STLDR sin entry")
@@ -231,10 +250,10 @@ def program_external(
         log("ERROR: no hay segmentos PT_LOAD en RAM.")
         return False
 
-    scratch, trampoline, stack_addr = _pick_ram_layout(ram_segs)
+    scratch, trampoline, stack_addr = _pick_ram_layout(ram_segs, chunk_size)
     log(
-        f"Layout RAM: scratch=0x{scratch:08X} trampoline=0x{trampoline:08X} "
-        f"sp=0x{stack_addr:08X}"
+        f"Layout RAM: scratch=0x{scratch:08X} (+{chunk_size} B) "
+        f"trampoline=0x{trampoline:08X} sp=0x{stack_addr:08X}"
     )
 
     tmp = Path(tempfile.mkdtemp(prefix="stldr_"))
@@ -274,14 +293,14 @@ def program_external(
     chunk_files: list[tuple[int, str, int]] = []
     offset = 0
     idx = 0
-    log(f"Partiendo en bloques de {CHUNK_SIZE}…")
+    log(f"Partiendo en bloques de {chunk_size} B…")
     while offset < len(blob):
-        piece = blob[offset : offset + CHUNK_SIZE]
+        piece = blob[offset : offset + chunk_size]
         rel = f"chunks/c{idx:05d}.bin"
         (tmp / rel).write_bytes(piece)
         chunk_files.append((min_a + offset, rel, len(piece)))
         idx += 1
-        offset += CHUNK_SIZE
+        offset += chunk_size
         if idx == 1 or idx % 64 == 0 or offset >= len(blob):
             log(f"  preparados {idx} bloques ({min(offset, len(blob))}/{len(blob)})")
 
@@ -510,8 +529,8 @@ def program_external(
                 "otro puerto USB; la flash interna puede haber quedado OK."
             )
             return False
-        if batch_i < n_batches:
-            time.sleep(WRITE_BATCH_PAUSE_S)
+        if batch_i < n_batches and batch_pause_s > 0:
+            time.sleep(batch_pause_s)
 
     # --- Fase 4: verificar primeras palabras + reset para arrancar la app ---
     log("=== Fase 4/4: Verificar 0x90000000 + reset ===")
