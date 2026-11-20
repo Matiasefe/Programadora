@@ -210,9 +210,9 @@ class MainWindow(QMainWindow):
             "F4/F1/F7: .hex/.elf y .stldr vacío + NRST cableado.\n"
             "Sin .stldr: solo flash interna (F1…H7/U5).\n"
             "Con .stldr: región 0x90000000 → QSPI/OSPI vía loader (sin Cube).\n"
-            "Riverdi grande: SWD 2 MHz + Write 8 KiB + pausa 0.75–1.5 s. "
-            "16 KiB + 3.3 MHz suele cortar USB a mitad; la v15 reintenta "
-            "esperando el COM (no se cuelga 6 min en connect)."
+            "Riverdi: modo RSP nativo (sin gdb.exe) — 1 attach, Init 1 vez, "
+            "Write streaming. Si falla, fallback GDB. "
+            "Recomendado: SWD 2 MHz + Write 8 KiB + pausa 0.75–1.5 s."
         )
         hint.setWordWrap(True)
         fg.addWidget(hint, 8, 0, 1, 3)

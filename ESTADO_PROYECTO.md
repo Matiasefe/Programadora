@@ -16,7 +16,7 @@ Programa flash interna F1…H7/U5 y Riverdi con `.stldr` (QSPI/OSPI) **sin** Cub
 - Fix falso AVISO erase (no confundir con “timeout to wait for device halts”).
 - STLDR v10: timeout MassErase escalado (~60 MB ya no corta a 20 min); SectorErase por lotes.
 - GUI: SWD (default 2 MHz), **Tamaño Write** 4/8/16 KiB (default 8), pausa entre lotes.
-- STLDR v15: reconnect tras corte USB (espera COM + stall 45s); lotes 8 si chunk=16 KiB.
+- STLDR **v16**: host RSP nativo (`bmp_rsp.py`) sin gdb.exe — 1 sesión, Init 1×, Write streaming; fallback GDB.
 
 ## Flasheo F4 (checklist si falla)
 

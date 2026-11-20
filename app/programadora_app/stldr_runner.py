@@ -17,7 +17,7 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 15
+STLDR_RUNNER_VERSION = 16
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
@@ -261,7 +261,13 @@ def program_external(
     swd_freq_hz: int = DEFAULT_SWD_FREQ_HZ,
     chunk_size: int = CHUNK_SIZE_DEFAULT,
     batch_pause_s: float = WRITE_BATCH_PAUSE_S,
+    prefer_native: bool = True,
 ) -> bool:
+    """Programa flash externa.
+
+    Por defecto usa RSP nativo (sin gdb.exe): un attach, Init una vez,
+    Write en streaming. Si falla el handshake/sesión, cae al runner GDB.
+    """
     from intelhex import IntelHex
 
     stldr = stldr.resolve()
@@ -270,9 +276,35 @@ def program_external(
     chunk_size = _clamp_chunk_size(chunk_size)
     batch_pause_s = max(0.0, float(batch_pause_s))
 
+    if prefer_native:
+        log(
+            f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} — "
+            "intentando RSP nativo (sin gdb.exe, 1 sesión)…"
+        )
+        try:
+            from . import stldr_native
+
+            ok = stldr_native.program_external_native(
+                port=port,
+                stldr=stldr,
+                external_hex=external_hex,
+                log=log,
+                swd_freq_hz=swd_freq_hz,
+                chunk_size=chunk_size,
+                batch_pause_s=batch_pause_s,
+            )
+            if ok:
+                return True
+            log(
+                "AVISO: RSP nativo no terminó OK — "
+                "fallback a gdb.exe (lotes)…"
+            )
+        except Exception as exc:  # noqa: BLE001
+            log(f"AVISO: RSP nativo no usable ({exc}) — fallback gdb.exe…")
+
     log(
         f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} "
-        f"(SWD {swd_freq_hz} Hz, chunk {chunk_size} B, "
+        f"(GDB fallback | SWD {swd_freq_hz} Hz, chunk {chunk_size} B, "
         f"pause lote {batch_pause_s:.2f}s)"
     )
     info = _elf_info(stldr)
