@@ -210,9 +210,8 @@ class MainWindow(QMainWindow):
             "F4/F1/F7: .hex/.elf y .stldr vacío + NRST cableado.\n"
             "Sin .stldr: solo flash interna (F1…H7/U5).\n"
             "Con .stldr: región 0x90000000 → QSPI/OSPI vía loader (sin Cube).\n"
-            "Riverdi: modo RSP nativo (sin gdb.exe) — 1 attach, Init 1 vez, "
-            "Write streaming. Si falla, fallback GDB. "
-            "Recomendado: SWD 2 MHz + Write 8 KiB + pausa 0.75–1.5 s."
+            "Riverdi híbrido: MassErase con GDB (estable) + Write RSP nativo "
+            "(1 attach, streaming). Recomendado: SWD 2 MHz + Write 8 KiB."
         )
         hint.setWordWrap(True)
         fg.addWidget(hint, 8, 0, 1, 3)

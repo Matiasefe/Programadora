@@ -17,7 +17,7 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 16
+STLDR_RUNNER_VERSION = 17
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
@@ -252,6 +252,178 @@ def _session_preamble(
     ]
 
 
+def erase_external_gdb(
+    gdb: str,
+    port: str,
+    stldr: Path,
+    external_hex: Path,
+    log: LogFn,
+    swd_freq_hz: int = DEFAULT_SWD_FREQ_HZ,
+) -> bool:
+    """MassErase (o SectorErase) vía gdb.exe — el camino que ya funcionaba."""
+    from intelhex import IntelHex
+
+    stldr = stldr.resolve()
+    external_hex = external_hex.resolve()
+    swd_freq_hz = max(100_000, min(int(swd_freq_hz), MAX_SWD_FREQ_HZ))
+
+    info = _elf_info(stldr)
+    init_addr = info["symbols"].get("Init", info["entry"])
+    mass_addr = info["symbols"].get("MassErase")
+    sector_addr = info["symbols"].get("SectorErase")
+    if init_addr is None:
+        log("ERROR: no hay Init ni entry en el .stldr.")
+        return False
+    if mass_addr is None and sector_addr is None:
+        log("AVISO: .stldr sin MassErase/SectorErase — se omite erase GDB")
+        return True
+
+    ram_segs = [s for s in info["segments"] if s["vaddr"] >= RAM_MIN]
+    if not ram_segs:
+        log("ERROR: no hay segmentos PT_LOAD en RAM.")
+        return False
+
+    # scratch chico alcanza para Init/Erase
+    scratch, trampoline, stack_addr = _pick_ram_layout(ram_segs, 4096)
+    tmp = Path(tempfile.mkdtemp(prefix="stldr_erase_"))
+    log(f"=== MassErase vía GDB (como antes) | temp {tmp} ===")
+
+    restore_ram: list[str] = []
+    for i, seg in enumerate(ram_segs):
+        name = f"seg{i}.bin"
+        (tmp / name).write_bytes(seg["data"])
+        restore_ram.append(f"restore {name} binary 0x{seg['vaddr']:X}")
+        log(f"  seg RAM {i}: {seg['filesz']} bytes → 0x{seg['vaddr']:08X}")
+
+    ih = IntelHex(str(external_hex))
+    addrs = ih.addresses()
+    if not addrs:
+        log("Sin datos externos — nada que borrar.")
+        return True
+    min_a, max_a = min(addrs), max(addrs)
+    span = max_a - min_a + 1
+
+    # Init fail-fast
+    lines = _session_preamble(
+        tmp, port, restore_ram, "gdb_erase_init.log", swd_freq_hz=swd_freq_hz
+    )
+    _append_call(
+        lines,
+        func=int(init_addr),
+        trampoline=trampoline,
+        stack=stack_addr,
+        label="Init",
+    )
+    lines.extend(["detach", "quit"])
+    script = tmp / "phase_erase_init.gdb"
+    _write_gdb_script(script, lines)
+    if not _run_gdb_live(
+        gdb, script, cwd=tmp, log_name="gdb_erase_init.log", log=log, timeout_s=120
+    ):
+        log("ERROR: Init (pre-erase GDB) falló")
+        return False
+    log("Init OK — MassErase GDB…")
+
+    if mass_addr is not None:
+        erase_timeout = _mass_erase_timeout_s(span)
+        log(
+            f"MassErase() GDB — timeout {erase_timeout}s (~{erase_timeout // 60} min) "
+            f"para {_fmt_bytes(span)}. Heartbeat «GDB sigue» es normal."
+        )
+        lines = _session_preamble(
+            tmp,
+            port,
+            restore_ram,
+            "gdb_erase.log",
+            remotetimeout=erase_timeout,
+            swd_freq_hz=swd_freq_hz,
+        )
+        _append_call(
+            lines,
+            func=int(init_addr),
+            trampoline=trampoline,
+            stack=stack_addr,
+            label="Init",
+        )
+        _append_call(
+            lines,
+            func=int(mass_addr),
+            trampoline=trampoline,
+            stack=stack_addr,
+            label="MassErase",
+        )
+        lines.extend(["detach", "quit"])
+        script = tmp / "phase_erase.gdb"
+        _write_gdb_script(script, lines)
+        if not _run_gdb_live(
+            gdb,
+            script,
+            cwd=tmp,
+            log_name="gdb_erase.log",
+            log=log,
+            timeout_s=erase_timeout,
+        ):
+            log("ERROR en MassErase GDB")
+            return False
+    else:
+        assert sector_addr is not None
+        sectors: list[tuple[int, int]] = []
+        a = min_a & ~(SECTOR_ERASE_STEP - 1)
+        while a <= max_a:
+            end_a = min(a + SECTOR_ERASE_STEP - 1, max_a)
+            sectors.append((a, end_a))
+            a += SECTOR_ERASE_STEP
+        n_sec_batches = (len(sectors) + SECTOR_ERASE_BATCH - 1) // SECTOR_ERASE_BATCH
+        log(f"SectorErase GDB ×{len(sectors)} en {n_sec_batches} lotes")
+        for sb in range(0, len(sectors), SECTOR_ERASE_BATCH):
+            batch = sectors[sb : sb + SECTOR_ERASE_BATCH]
+            batch_i = sb // SECTOR_ERASE_BATCH + 1
+            erase_timeout = _sector_erase_timeout_s(len(batch))
+            log_name = f"gdb_erase_{batch_i:03d}.log"
+            lines = _session_preamble(
+                tmp,
+                port,
+                restore_ram,
+                log_name,
+                remotetimeout=erase_timeout,
+                swd_freq_hz=swd_freq_hz,
+            )
+            _append_call(
+                lines,
+                func=int(init_addr),
+                trampoline=trampoline,
+                stack=stack_addr,
+                label="Init",
+            )
+            for j, (sa, ea) in enumerate(batch):
+                global_i = sb + j
+                _append_call(
+                    lines,
+                    func=int(sector_addr),
+                    trampoline=trampoline,
+                    stack=stack_addr,
+                    label=f"Sec{global_i}",
+                    r0=sa,
+                    r1=ea,
+                )
+            lines.extend(["detach", "quit"])
+            script = tmp / f"phase_erase_{batch_i:03d}.gdb"
+            _write_gdb_script(script, lines)
+            if not _run_gdb_live(
+                gdb,
+                script,
+                cwd=tmp,
+                log_name=log_name,
+                log=log,
+                timeout_s=erase_timeout,
+            ):
+                log(f"ERROR SectorErase GDB lote {batch_i}")
+                return False
+
+    log("Erase GDB OK — sigue Write nativo")
+    return True
+
+
 def program_external(
     gdb: str,
     port: str,
@@ -265,8 +437,10 @@ def program_external(
 ) -> bool:
     """Programa flash externa.
 
-    Por defecto usa RSP nativo (sin gdb.exe): un attach, Init una vez,
-    Write en streaming. Si falla el handshake/sesión, cae al runner GDB.
+    Híbrido (default):
+      1) MassErase con gdb.exe (estable, como antes)
+      2) Write streaming RSP nativo (1 attach, Init 1×)
+    Si el Write nativo falla → fallback GDB completo.
     """
     from intelhex import IntelHex
 
@@ -279,8 +453,17 @@ def program_external(
     if prefer_native:
         log(
             f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} — "
-            "intentando RSP nativo (sin gdb.exe, 1 sesión)…"
+            "híbrido: MassErase=GDB + Write=RSP nativo"
         )
+        if not erase_external_gdb(
+            gdb=gdb,
+            port=port,
+            stldr=stldr,
+            external_hex=external_hex,
+            log=log,
+            swd_freq_hz=swd_freq_hz,
+        ):
+            return False
         try:
             from . import stldr_native
 
@@ -292,15 +475,16 @@ def program_external(
                 swd_freq_hz=swd_freq_hz,
                 chunk_size=chunk_size,
                 batch_pause_s=batch_pause_s,
+                do_erase=False,
             )
             if ok:
                 return True
             log(
-                "AVISO: RSP nativo no terminó OK — "
-                "fallback a gdb.exe (lotes)…"
+                "AVISO: Write RSP nativo no terminó OK — "
+                "fallback a gdb.exe (Write por lotes)…"
             )
         except Exception as exc:  # noqa: BLE001
-            log(f"AVISO: RSP nativo no usable ({exc}) — fallback gdb.exe…")
+            log(f"AVISO: Write RSP nativo no usable ({exc}) — fallback gdb.exe…")
 
     log(
         f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} "

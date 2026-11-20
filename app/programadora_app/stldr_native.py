@@ -1,7 +1,8 @@
-"""Programación externa .stldr vía RSP nativo (sin gdb.exe).
+"""Write externa .stldr vía RSP nativo (sin gdb.exe).
 
-Una sola sesión: attach → cargar loader → Init → MassErase → Writes en
-streaming. Reconnect solo si cae el USB; Init otra vez tras reconnect.
+Por defecto NO hace MassErase (eso va por GDB, más fiable).
+Sesión: attach → loader → Init → Write streaming.
+Reconnect si cae USB; retoma Write sin re-borrar.
 """
 
 from __future__ import annotations
@@ -10,14 +11,13 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import bmp_rsp
 from .bmp_rsp import BmpRsp, BmpRspError
 from .probe import normalize_port
 from . import stldr_runner as base
 
 LogFn = Callable[[str], None]
 
-NATIVE_VERSION = 1
+NATIVE_VERSION = 2
 
 
 def program_external_native(
@@ -28,6 +28,7 @@ def program_external_native(
     swd_freq_hz: int = base.DEFAULT_SWD_FREQ_HZ,
     chunk_size: int = base.CHUNK_SIZE_DEFAULT,
     batch_pause_s: float = base.WRITE_BATCH_PAUSE_S,
+    do_erase: bool = False,
 ) -> bool:
     from intelhex import IntelHex
 
@@ -40,7 +41,8 @@ def program_external_native(
 
     log(
         f"STLDR_NATIVE_VERSION={NATIVE_VERSION} / runner={base.STLDR_RUNNER_VERSION} "
-        f"(RSP sin gdb.exe | SWD {swd_freq_hz} Hz | chunk {chunk_size} B)"
+        f"(Write RSP | erase={'sí' if do_erase else 'no, ya GDB'} | "
+        f"SWD {swd_freq_hz} Hz | chunk {chunk_size} B)"
     )
 
     info = base._elf_info(stldr)
@@ -49,8 +51,8 @@ def program_external_native(
         return False
     init_addr = info["symbols"].get("Init", info["entry"])
     write_addr = info["symbols"]["Write"]
-    mass_addr = info["symbols"].get("MassErase")
-    sector_addr = info["symbols"].get("SectorErase")
+    mass_addr = info["symbols"].get("MassErase") if do_erase else None
+    sector_addr = info["symbols"].get("SectorErase") if do_erase else None
     if init_addr is None:
         log("ERROR: no hay Init ni entry en el .stldr.")
         return False
@@ -97,7 +99,7 @@ def program_external_native(
     )
 
     next_i = 0
-    need_erase = True
+    need_erase = bool(do_erase)
     max_sessions = 8
 
     for session in range(1, max_sessions + 1):

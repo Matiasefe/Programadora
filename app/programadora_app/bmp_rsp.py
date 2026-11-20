@@ -176,16 +176,48 @@ class BmpRsp:
         except BmpRspError:
             self._no_ack = False
 
-    def monitor(self, command: str, timeout_s: float = 10.0) -> str:
-        hx = command.encode("utf-8").hex()
-        r = self.cmd(f"qRcmd,{hx}", timeout_s=timeout_s)
-        if r == b"OK" or r == b"":
+    @staticmethod
+    def _decode_o_packet(body: bytes) -> str:
+        """Paquete consola GDB ``Oxx`` → texto."""
+        if not body.startswith(b"O"):
             return ""
-        # respuesta hex-encoded text
+        hx = body[1:].decode("ascii", errors="ignore")
+        if not hx:
+            return ""
         try:
-            return bytes.fromhex(r.decode("ascii")).decode("utf-8", errors="replace")
+            return bytes.fromhex(hx).decode("utf-8", errors="replace")
         except Exception:  # noqa: BLE001
-            return r.decode("latin-1", errors="replace")
+            return ""
+
+    def monitor(self, command: str, timeout_s: float = 10.0) -> str:
+        """``monitor …`` vía qRcmd; drena todos los ``O`` hasta ``OK``."""
+        hx = command.encode("utf-8").hex()
+        body = f"qRcmd,{hx}".encode("ascii")
+        pkt = b"$" + body + b"#%02x" % _checksum(body)
+        self._send_raw(pkt)
+        if not self._no_ack:
+            self._read_ack(timeout_s=min(2.0, timeout_s))
+        texts: list[str] = []
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                r = self._recv_packet(timeout_s=min(2.0, remaining))
+            except BmpRspError:
+                continue
+            if r in (b"OK", b""):
+                break
+            if r.startswith(b"O"):
+                t = self._decode_o_packet(r)
+                if t:
+                    texts.append(t)
+                continue
+            if r.startswith(b"E"):
+                raise BmpRspError(f"qRcmd '{command}' error: {r!r}")
+            # stop reply u otro: devolver como texto crudo
+            texts.append(r.decode("latin-1", errors="replace"))
+            break
+        return "".join(texts)
 
     def swdp_scan(self) -> str:
         return self.monitor("swdp_scan", timeout_s=15.0)
@@ -278,16 +310,44 @@ class BmpRsp:
         except BmpRspError:
             pass
 
-    def continue_until_break(self, timeout_s: float) -> bytes:
-        """Continue y espera stop reply (breakpoint / signal)."""
-        # Enviar continue sin esperar stop en el mismo cmd helper:
+    def continue_until_break(
+        self, timeout_s: float, heartbeat_s: float = 15.0, label: str = ""
+    ) -> bytes:
+        """Continue y espera stop reply; drena ``O`` y hace heartbeat."""
         body = b"c"
         pkt = b"$" + body + b"#%02x" % _checksum(body)
         self._send_raw(pkt)
         if not self._no_ack:
             self._read_ack(timeout_s=2.0)
-        # Stop reply puede tardar (MassErase, Write NOR)
-        return self._recv_packet(timeout_s=timeout_s)
+        start = time.monotonic()
+        deadline = start + timeout_s
+        last_hb = start
+        tag = label or "continue"
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            try:
+                r = self._recv_packet(timeout_s=min(2.0, max(0.2, remaining)))
+            except BmpRspError:
+                now = time.monotonic()
+                if now - last_hb >= heartbeat_s:
+                    self.log(
+                        f"... {tag} sigue ({int(now - start)}s, "
+                        f"quedan ~{int(deadline - now)}s)"
+                    )
+                    last_hb = now
+                continue
+            if r.startswith(b"O"):
+                t = self._decode_o_packet(r)
+                if t.strip():
+                    self.log(t.rstrip())
+                continue
+            if r.startswith((b"T", b"S", b"W", b"X")):
+                return r
+            if r.startswith(b"E"):
+                raise BmpRspError(f"Error en continue: {r!r}")
+            # otro paquete: tratar como stop
+            return r
+        raise BmpRspError(f"Timeout {timeout_s:.0f}s esperando retorno de {tag}")
 
     def call_thumb(
         self,
@@ -304,9 +364,7 @@ class BmpRsp:
         """Invoca función Thumb; retorno vía breakpoint en trampoline (LR)."""
         if label:
             self.log(f">>> CALL {label} (RSP nativo)…")
-        # breakpoint software en dirección de retorno
         self.insert_sw_break(trampoline & ~1, 2)
-        # regs ARM: 0=r0 … 13=sp 14=lr 15=pc 16=xpsr
         self.set_reg32(0, r0)
         self.set_reg32(1, r1)
         self.set_reg32(2, r2)
@@ -314,12 +372,13 @@ class BmpRsp:
         self.set_reg32(14, trampoline | 1)
         self.set_reg32(16, 0x01000000)  # Thumb EPSR.T
         self.set_reg32(15, func | 1)
-        stop = self.continue_until_break(timeout_s=timeout_s)
+        stop = self.continue_until_break(
+            timeout_s=timeout_s, heartbeat_s=15.0, label=label or "fn"
+        )
         if stop.startswith(b"W") or stop.startswith(b"X"):
             raise BmpRspError(f"Target salió: {stop!r}")
         if stop.startswith(b"E"):
             raise BmpRspError(f"Error en continue: {stop!r}")
-        # leer r0
         ret = self.get_reg32(0)
         if label:
             self.log(f"RET_{label} 0x{ret:x}")
