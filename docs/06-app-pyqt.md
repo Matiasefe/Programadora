@@ -66,10 +66,9 @@ app/
 ## Notas
 
 - La familia del combo es **informativa**; BMP identifica el MCU por SWD.
-- El flujo `.stldr` (runner **v17**): **MassErase con GDB** (como antes) + **Write RSP nativo** (1 attach, Init 1×, streaming). Fallback GDB si el Write nativo falla.
+- El flujo `.stldr` (runner **v18**): **todo por GDB** otra vez (RSP Write desactivado: W0 no retornaba). Quedan chunks 4/8/16 KiB, lotes chicos, reintentos y pausa entre lotes.
 - Combos: **SWD** 1/2/3.3/4/6 MHz; **Tamaño Write** 4/8/16 KiB; **Pausa entre lotes** 0–1.5 s.
-- Reconnect Write: retoma desde el último bloque OK **sin** repetir MassErase.
-- Riverdi tipico: SWD **2 MHz** + Write **8 KiB**.
+- Riverdi tipico: SWD **2 MHz** + Write **8 KiB** + pausa 0.75–1.5 s.
 - HEX externos grandes: `MassErase` puede llevar **45–120 min**. No canceles mientras diga `GDB sigue`.
 - Pinout de tu PCB: ver `docs/04-placa-propia-pinout.md`.
 

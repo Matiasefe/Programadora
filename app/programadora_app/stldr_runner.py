@@ -17,7 +17,7 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 17
+STLDR_RUNNER_VERSION = 18
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
@@ -433,14 +433,14 @@ def program_external(
     swd_freq_hz: int = DEFAULT_SWD_FREQ_HZ,
     chunk_size: int = CHUNK_SIZE_DEFAULT,
     batch_pause_s: float = WRITE_BATCH_PAUSE_S,
-    prefer_native: bool = True,
+    prefer_native: bool = False,
+    skip_erase: bool = False,
 ) -> bool:
-    """Programa flash externa.
+    """Programa flash externa vía gdb.exe (estable).
 
-    Híbrido (default):
-      1) MassErase con gdb.exe (estable, como antes)
-      2) Write streaming RSP nativo (1 attach, Init 1×)
-    Si el Write nativo falla → fallback GDB completo.
+    El Write RSP nativo se desactivó por defecto: W0 no volvía (timeout) y
+    el fallback re-hacía MassErase → media hora perdida. Optimizaciones que
+    sí quedan: chunks 4/8/16 KiB, lotes chicos, reintentos, pausa entre lotes.
     """
     from intelhex import IntelHex
 
@@ -449,11 +449,12 @@ def program_external(
     swd_freq_hz = max(100_000, min(int(swd_freq_hz), MAX_SWD_FREQ_HZ))
     chunk_size = _clamp_chunk_size(chunk_size)
     batch_pause_s = max(0.0, float(batch_pause_s))
+    erase_done = bool(skip_erase)
 
     if prefer_native:
         log(
             f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} — "
-            "híbrido: MassErase=GDB + Write=RSP nativo"
+            "híbrido experimental: MassErase=GDB + Write=RSP"
         )
         if not erase_external_gdb(
             gdb=gdb,
@@ -464,6 +465,7 @@ def program_external(
             swd_freq_hz=swd_freq_hz,
         ):
             return False
+        erase_done = True
         try:
             from . import stldr_native
 
@@ -480,16 +482,17 @@ def program_external(
             if ok:
                 return True
             log(
-                "AVISO: Write RSP nativo no terminó OK — "
-                "fallback a gdb.exe (Write por lotes)…"
+                "AVISO: Write RSP falló — fallback GDB Write "
+                "(sin repetir MassErase)"
             )
         except Exception as exc:  # noqa: BLE001
-            log(f"AVISO: Write RSP nativo no usable ({exc}) — fallback gdb.exe…")
+            log(f"AVISO: Write RSP no usable ({exc}) — fallback GDB Write")
 
     log(
         f"STLDR_RUNNER_VERSION={STLDR_RUNNER_VERSION} "
-        f"(GDB fallback | SWD {swd_freq_hz} Hz, chunk {chunk_size} B, "
-        f"pause lote {batch_pause_s:.2f}s)"
+        f"(GDB | SWD {swd_freq_hz} Hz, chunk {chunk_size} B, "
+        f"pause lote {batch_pause_s:.2f}s"
+        f"{', erase ya hecho' if erase_done else ''})"
     )
     info = _elf_info(stldr)
     log(f"STLDR entry=0x{info['entry']:08X}" if info["entry"] else "STLDR sin entry")
@@ -598,11 +601,11 @@ def program_external(
         return False
     log("Init OK — seguimos")
 
-    # --- Fase 2: Init + erase fiable del rango ---
-    # Un solo SectorErase(min,max) a veces no borra todo el rango en estos
-    # loaders → Write “OK” pero datos corruptos → pantalla negra.
+    # --- Fase 2: Init + erase (omitir si ya se borró antes) ---
     log("=== Fase 2/4: Erase ===")
-    if mass_addr is not None:
+    if erase_done:
+        log("Erase omitido (ya se hizo MassErase antes) — seguimos a Write.")
+    elif mass_addr is not None:
         erase_timeout = _mass_erase_timeout_s(len(blob))
         log(
             f"MassErase() del chip OSPI/QSPI — timeout {erase_timeout}s "
@@ -644,7 +647,7 @@ def program_external(
         ):
             log("ERROR en fase Erase (MassErase)")
             return False
-    elif sector_addr is not None:
+    elif sector_addr is not None and not erase_done:
         # Imágenes grandes: varios scripts GDB (evita un continue×15k)
         sectors: list[tuple[int, int]] = []
         a = min_a & ~(SECTOR_ERASE_STEP - 1)
@@ -707,9 +710,12 @@ def program_external(
             ):
                 log(f"ERROR en fase Erase lote {batch_i}/{n_sec_batches}")
                 return False
-    else:
+    elif not erase_done:
         log("AVISO: sin erase en el loader — se intenta Write directo")
-    log("Erase OK — seguimos")
+    if not erase_done:
+        log("Erase OK — seguimos")
+    else:
+        log("Erase previo OK — seguimos a Write")
 
     # --- Fase 3: Writes por lotes ---
     batch_len = _write_batch_len(chunk_size)
