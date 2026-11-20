@@ -17,7 +17,7 @@ from typing import Callable
 
 LogFn = Callable[[str], None]
 
-STLDR_RUNNER_VERSION = 14
+STLDR_RUNNER_VERSION = 15
 # NOR: borrar sector a sector del rango HEX (4 KiB típico MX25)
 SECTOR_ERASE_STEP = 0x1000
 
@@ -28,9 +28,12 @@ RAM_MIN = 0x20000000
 # Lotes chicos: con 64, Riverdi ~18 MB cortaba USB a mitad de sesión
 # ("Remote connection closed"). 16 = más reconnects, más estable.
 WRITE_BATCH = 16
-WRITE_BATCH_RETRIES = 4
+WRITE_BATCH_RETRIES = 5
 # Delay solo entre lotes (no entre cada Write): estabilidad USB sin frenar tanto.
 WRITE_BATCH_PAUSE_S = 0.75
+# Tras Remote connection closed el COM puede quedar ocupado; GDB se cuelga en connect.
+CONNECT_STALL_S = 45.0
+PORT_WAIT_S = 25.0
 # SectorErase por sesión GDB (imágenes grandes: no meter 15k continues en un script)
 SECTOR_ERASE_BATCH = 128
 # Tope SWD medido en la sonda F103 (BMP clampa 8→6 MHz)
@@ -44,6 +47,45 @@ def _clamp_chunk_size(n: int) -> int:
         return n
     # redondear al choice más cercano
     return min(CHUNK_SIZE_CHOICES, key=lambda c: abs(c - n))
+
+
+def _write_batch_len(chunk_size: int) -> int:
+    """Menos Writes por sesión GDB si el chunk es grande (16 KiB)."""
+    if chunk_size >= 16384:
+        return 8
+    if chunk_size >= 8192:
+        return 12
+    return WRITE_BATCH
+
+
+def _wait_port_ready(port: str, log: LogFn, timeout_s: float = PORT_WAIT_S) -> bool:
+    """Espera a que el COM GDB vuelva a abrirse tras un corte USB."""
+    try:
+        import serial
+        from serial import SerialException
+    except ImportError:
+        time.sleep(min(8.0, timeout_s))
+        return True
+
+    # Normalizar a nombre que pyserial entiende en Windows
+    dev = port
+    if dev.startswith("\\\\.\\"):
+        dev = dev[4:]
+    log(f"Esperando puerto GDB listo ({dev}, hasta {timeout_s:.0f}s)…")
+    deadline = time.monotonic() + timeout_s
+    last_err = ""
+    while time.monotonic() < deadline:
+        try:
+            ser = serial.Serial(port=dev, baudrate=115200, timeout=0.2)
+            ser.close()
+            log("Puerto GDB OK.")
+            time.sleep(0.4)
+            return True
+        except (SerialException, OSError, ValueError) as exc:
+            last_err = str(exc)
+            time.sleep(0.5)
+    log(f"AVISO: puerto no respondió a tiempo ({last_err or 'timeout'})")
+    return False
 
 
 def _fmt_bytes(n: int) -> str:
@@ -454,30 +496,32 @@ def program_external(
     log("Erase OK — seguimos")
 
     # --- Fase 3: Writes por lotes ---
-    n_batches = (len(chunk_files) + WRITE_BATCH - 1) // WRITE_BATCH
+    batch_len = _write_batch_len(chunk_size)
+    n_batches = (len(chunk_files) + batch_len - 1) // batch_len
     log(
         f"=== Fase 3/4: Write ({len(chunk_files)} bloques, "
-        f"lotes de {WRITE_BATCH}, ~{n_batches} sesiones GDB) ==="
+        f"lotes de {batch_len}, ~{n_batches} sesiones GDB) ==="
     )
-    for batch_start in range(0, len(chunk_files), WRITE_BATCH):
-        batch = chunk_files[batch_start : batch_start + WRITE_BATCH]
-        batch_i = batch_start // WRITE_BATCH + 1
+    for batch_start in range(0, len(chunk_files), batch_len):
+        batch = chunk_files[batch_start : batch_start + batch_len]
+        batch_i = batch_start // batch_len + 1
         log(
             f"--- Lote {batch_i}/{n_batches}: "
             f"bloques {batch_start}..{batch_start + len(batch) - 1} ---"
         )
-        write_timeout = max(180, len(batch) * 25)
+        # 16 KiB × 8 writes: más margen por continue
+        write_timeout = max(240, len(batch) * 40)
         ok = False
         for attempt in range(1, WRITE_BATCH_RETRIES + 1):
             log_name = f"gdb_write_{batch_i:03d}_a{attempt}.log"
             if attempt > 1:
-                pause = 1.5 * attempt
+                pause = 4.0 + 3.0 * attempt
                 log(
                     f"Reintento {attempt}/{WRITE_BATCH_RETRIES} del lote "
-                    f"{batch_i} (pausa {pause:.1f}s; típico tras "
-                    "Remote connection closed)…"
+                    f"{batch_i} (pausa {pause:.1f}s + espera COM)…"
                 )
                 time.sleep(pause)
+                _wait_port_ready(port, log, timeout_s=PORT_WAIT_S)
             lines = _session_preamble(
                 tmp,
                 port,
@@ -518,15 +562,17 @@ def program_external(
                 log_name=log_name,
                 log=log,
                 timeout_s=write_timeout,
+                connect_stall_s=CONNECT_STALL_S,
             )
             if ok:
                 break
         if not ok:
             log(f"ERROR en lote Write {batch_i}/{n_batches} tras reintentos")
             log(
-                "«Remote connection closed» suele ser USB/SWD inestable en "
-                "sesiones largas. Probá SWD 1–2 MHz en la GUI, cable corto, "
-                "otro puerto USB; la flash interna puede haber quedado OK."
+                "«Remote connection closed» / connect colgado: USB/CDC. "
+                "Probá SWD 2 MHz + Write 8 KiB, cable corto, USB directo a la PC "
+                "(sin hub). La flash interna puede haber quedado OK; la externa "
+                "hasta el último lote OK puede estar a medias."
             )
             return False
         if batch_i < n_batches and batch_pause_s > 0:
@@ -579,8 +625,14 @@ def _run_gdb_live(
     log_name: str,
     log: LogFn,
     timeout_s: int,
+    connect_stall_s: float | None = None,
 ) -> bool:
-    """Lanza GDB y muestra gdb_*.log en vivo + heartbeat cada 10s."""
+    """Lanza GDB y muestra gdb_*.log en vivo + heartbeat cada 10s.
+
+    Si ``connect_stall_s`` está set y no aparece actividad de attach/loader
+    en ese tiempo, se asume COM colgado tras un corte USB y se mata GDB
+    para poder reintentar (antes esperaba todo el timeout del lote).
+    """
     log_path = cwd / log_name
     if log_path.exists():
         try:
@@ -612,6 +664,19 @@ def _run_gdb_live(
     # Heartbeat más espaciado en operaciones largas (MassErase 60 MB, etc.)
     hb_every = 30.0 if timeout_s >= 900 else 10.0
     combined: list[str] = []
+    connected = False
+
+    def _note_progress(text: str) -> None:
+        nonlocal connected
+        low = text.lower()
+        if (
+            "loader en ram ok" in low
+            or "available targets" in low
+            or "ret_init" in low
+            or ">>> call" in low
+            or "transfer rate" in low
+        ):
+            connected = True
 
     while True:
         rc = proc.poll()
@@ -627,14 +692,31 @@ def _run_gdb_live(
                     if ln.strip():
                         log(ln)
                         combined.append(ln)
+                        _note_progress(ln)
+        # stdout directo (por si logging aún no arrancó)
+        # no leemos bloqueante; el drain es al final
         now = time.monotonic()
+        if (
+            connect_stall_s is not None
+            and not connected
+            and rc is None
+            and (now - start) > connect_stall_s
+        ):
+            log(
+                f"ERROR: GDB sin attach/loader tras {int(connect_stall_s)}s "
+                "(COM colgado tras Remote connection closed) — matando para reintentar"
+            )
+            proc.kill()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return False
         if now - last_hb >= hb_every and rc is None:
             elapsed = int(now - start)
             left = max(0, timeout_s - elapsed)
-            log(
-                f"... GDB sigue ({elapsed}s, quedan ~{left}s) — "
-                "Erase/Write largo es normal; no canceles"
-            )
+            phase = "conectando…" if not connected else "Erase/Write largo es normal"
+            log(f"... GDB sigue ({elapsed}s, quedan ~{left}s) — {phase}; no canceles")
             last_hb = now
         if rc is not None:
             # drenar stdout por si logging falló
@@ -647,11 +729,12 @@ def _run_gdb_live(
                     if ln.strip():
                         log(ln)
                         combined.append(ln)
+                        _note_progress(ln)
             break
         if now - start > timeout_s:
             log(
                 f"ERROR: timeout {timeout_s}s — matando GDB. "
-                "Si era MassErase de imagen grande, reintentá (v10 sube el límite)."
+                "Si era MassErase de imagen grande, reintentá."
             )
             proc.kill()
             try:
